@@ -985,7 +985,7 @@ if st.button("Check eligibility"):
         "apps": apps,
         "sub_apps": sub_apps,
         "target_team": f"{target.name} ({target.league_label})",
-        "Bilans found teams:", sorted(apps.keys())
+        "Bilans found teams":sorted(apps.keys())
 
     })
 
