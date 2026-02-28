@@ -531,11 +531,28 @@ def fetch_bilans_apps(
         tables = soup.find_all("table")
         for table in tables:
             # Find a likely header label near this table
+#            header_text = ""
+#            prev = table.find_previous(["h1", "h2", "h3", "div", "p"])
+#            if prev:
+#                header_text = _norm(prev.get_text(" ", strip=True))
+#
+#            tno = team_no_from_label(header_text)
+#            if tno is None:
+#                # Alternative: some pages put team label in a table caption or first row th
+#                cap = table.find("caption")
+#                if cap:
+#                    tno = team_no_from_label(_norm(cap.get_text(" ", strip=True)))
+#                if tno is None:
+#                    first_th = table.find("th")
+#                    if first_th:
+#                        tno = team_no_from_label(_norm(first_th.get_text(" ", strip=True)))
+
+            # Find a likely header label near this table
             header_text = ""
             prev = table.find_previous(["h1", "h2", "h3", "div", "p"])
             if prev:
                 header_text = _norm(prev.get_text(" ", strip=True))
-
+            
             tno = team_no_from_label(header_text)
             if tno is None:
                 # Alternative: some pages put team label in a table caption or first row th
@@ -546,6 +563,7 @@ def fetch_bilans_apps(
                     first_th = table.find("th")
                     if first_th:
                         tno = team_no_from_label(_norm(first_th.get_text(" ", strip=True)))
+
 
             if tno is None:
                 continue
