@@ -288,66 +288,141 @@ def infer_player_name_from_portrait(portrait_url: str) -> PlayerKey:
 #
 #    return None
 
+#def fetch_regular_registration_nominated_team(
+#    season_name: str,
+#    contest_type_token: str,
+#    player: PlayerKey,
+#) -> Optional[int]:
+#    """
+#    Robustly parses clubPools page tables.
+#    Looks for rows with first cell like '7.1' and a name cell containing 'Last, First'.
+#    """
+#    url = f"{BASE}/clubPools"
+#    params = {
+#        "club": str(MEYRIN_CLUB_ID),
+#        "contestType": contest_type_token,   # e.g. ${herren}
+#        "displayTyp": "vorrunde",
+#        "preferredLanguage": "German",
+#        "seasonName": season_name,
+#    }
+#    r = session.get(url, params=params, timeout=25)
+#    r.raise_for_status()
+#    soup = BeautifulSoup(r.text, "html.parser")
+#
+#    target_last = player.last.strip().lower()
+#    target_first = player.first.strip().lower()
+#
+#    # Scan all tables for rank+name patterns
+#    for table in soup.find_all("table"):
+#        for tr in table.find_all("tr"):
+#            tds = tr.find_all("td")
+#            if len(tds) < 2:
+#                continue
+#
+#            rank_txt = _norm(tds[0].get_text(" ", strip=True))
+#            m = re.match(r"^(\d+)\.\d+$", rank_txt)  # '7.1' -> team 7
+#            if not m:
+#                continue
+#            team_no = int(m.group(1))
+#
+#            name_txt = _norm(tds[1].get_text(" ", strip=True)).lower()
+#            # handle "Bilin, Bugra" and "Bugra Bilin"
+#            if (target_last in name_txt and target_first in name_txt):
+#                return team_no
+#
+#    # Optional: try Rückrunde too (some seasons only filled there)
+#    params["displayTyp"] = "rueckrunde"
+#    r = session.get(url, params=params, timeout=25)
+#    r.raise_for_status()
+#    soup = BeautifulSoup(r.text, "html.parser")
+#
+#    for table in soup.find_all("table"):
+#        for tr in table.find_all("tr"):
+#            tds = tr.find_all("td")
+#            if len(tds) < 2:
+#                continue
+#            rank_txt = _norm(tds[0].get_text(" ", strip=True))
+#            m = re.match(r"^(\d+)\.\d+$", rank_txt)
+#            if not m:
+#                continue
+#            team_no = int(m.group(1))
+#            name_txt = _norm(tds[1].get_text(" ", strip=True)).lower()
+#            if (target_last in name_txt and target_first in name_txt):
+#                return team_no
+#
+#    return None
+
 def fetch_regular_registration_nominated_team(
     season_name: str,
     contest_type_token: str,
     player: PlayerKey,
 ) -> Optional[int]:
     """
-    Robustly parses clubPools page tables.
-    Looks for rows with first cell like '7.1' and a name cell containing 'Last, First'.
+    Robust:
+    - Tries clubPools page(s)
+    - Scans table rows by finding a rank like '7.1'
+    - Checks FULL ROW text for player name
+    - Tries vorrunde and rueckrunde
+    - If clubPools doesn't contain the table, follows links to groupPools (common in click-tt)
     """
-    url = f"{BASE}/clubPools"
-    params = {
-        "club": str(MEYRIN_CLUB_ID),
-        "contestType": contest_type_token,   # e.g. ${herren}
-        "displayTyp": "vorrunde",
-        "preferredLanguage": "German",
-        "seasonName": season_name,
-    }
-    r = session.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-
     target_last = player.last.strip().lower()
     target_first = player.first.strip().lower()
 
-    # Scan all tables for rank+name patterns
-    for table in soup.find_all("table"):
-        for tr in table.find_all("tr"):
-            tds = tr.find_all("td")
-            if len(tds) < 2:
-                continue
+    def row_has_player(tr) -> bool:
+        row_text = _norm(tr.get_text(" ", strip=True)).lower()
+        return (target_last in row_text) and (target_first in row_text)
 
-            rank_txt = _norm(tds[0].get_text(" ", strip=True))
-            m = re.match(r"^(\d+)\.\d+$", rank_txt)  # '7.1' -> team 7
-            if not m:
+    def scan_html_for_rank_and_name(html: str) -> Optional[int]:
+        soup = BeautifulSoup(html, "html.parser")
+        # Look through ALL rows; if any cell is 'X.Y' and row contains player -> return X
+        for tr in soup.find_all("tr"):
+            # quick skip if row doesn't contain player
+            if not row_has_player(tr):
                 continue
-            team_no = int(m.group(1))
+            # find a rank token like 7.1 anywhere in the row
+            m = re.search(r"\b(\d+)\.\d+\b", _norm(tr.get_text(" ", strip=True)))
+            if m:
+                return int(m.group(1))
+        return None
 
-            name_txt = _norm(tds[1].get_text(" ", strip=True)).lower()
-            # handle "Bilin, Bugra" and "Bugra Bilin"
-            if (target_last in name_txt and target_first in name_txt):
-                return team_no
+    def fetch(url: str, params: dict) -> str:
+        r = session.get(url, params=params, timeout=25)
+        r.raise_for_status()
+        return r.text
 
-    # Optional: try Rückrunde too (some seasons only filled there)
-    params["displayTyp"] = "rueckrunde"
-    r = session.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+    # 1) Try clubPools directly (both halves)
+    clubpools_url = f"{BASE}/clubPools"
+    for display_typ in ("vorrunde", "rueckrunde"):
+        params = {
+            "club": str(MEYRIN_CLUB_ID),
+            "contestType": contest_type_token,
+            "displayTyp": display_typ,
+            "preferredLanguage": "German",
+            "seasonName": season_name,
+        }
+        html = fetch(clubpools_url, params)
+        team_no = scan_html_for_rank_and_name(html)
+        if team_no is not None:
+            return team_no
 
-    for table in soup.find_all("table"):
-        for tr in table.find_all("tr"):
-            tds = tr.find_all("td")
-            if len(tds) < 2:
+        # 2) If not found, clubPools might just be an index page: follow groupPools links
+        soup = BeautifulSoup(html, "html.parser")
+        group_links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            # groupPools pages commonly contain the actual registration table
+            if "groupPools" in href and "displayTyp" in href:
+                group_links.append(_abs_url(href))
+        # de-dup
+        group_links = list(dict.fromkeys(group_links))
+
+        for link in group_links[:30]:  # safety cap
+            try:
+                sub_html = session.get(link, timeout=25).text
+            except Exception:
                 continue
-            rank_txt = _norm(tds[0].get_text(" ", strip=True))
-            m = re.match(r"^(\d+)\.\d+$", rank_txt)
-            if not m:
-                continue
-            team_no = int(m.group(1))
-            name_txt = _norm(tds[1].get_text(" ", strip=True)).lower()
-            if (target_last in name_txt and target_first in name_txt):
+            team_no = scan_html_for_rank_and_name(sub_html)
+            if team_no is not None:
                 return team_no
 
     return None
