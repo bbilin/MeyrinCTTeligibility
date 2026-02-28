@@ -66,11 +66,16 @@ def _parse_team_no_from_name(name: str) -> Optional[int]:
     roman = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
     return roman.get(token)
 
-
 def league_rank(label: str) -> int:
     """
     Higher number == higher league.
-    Tune mapping if needed.
+    Supports formats:
+      - "Ligue 5"
+      - "5ème ligue"
+      - "5eme ligue"
+      - "5. Liga"
+      - "Liga 5"
+      - National: NLA/NLB/NLC
     """
     s = (label or "").lower()
 
@@ -82,17 +87,46 @@ def league_rank(label: str) -> int:
     if "nlc" in s:
         return 80
 
-    # French labels / German labels
-    # "Ligue 1" .. "Ligue 6"  / "1. Liga" .. "6. Liga"
+    # "Ligue 5" or "Liga 5"
     m = re.search(r"\b(?:ligue|liga)\s*(\d+)\b", s)
     if m:
         n = int(m.group(1))
-        # Ligue 1 is higher than Ligue 5 -> invert
-        return 70 - n  # Ligue 1 -> 69, Ligue 5 -> 65
+        return 70 - n  # Ligue 1 higher than Ligue 5
 
-    # fallback
+    # "5ème ligue" / "5eme ligue" / "5. liga"
+    m = re.search(r"\b(\d+)\s*(?:ème|eme|\.|)\s*(?:ligue|liga)\b", s)
+    if m:
+        n = int(m.group(1))
+        return 70 - n
+
     return 0
 
+#def league_rank(label: str) -> int:
+#    """
+#    Higher number == higher league.
+#    Tune mapping if needed.
+#    """
+#    s = (label or "").lower()
+#
+#    # National leagues
+#    if "nla" in s:
+#        return 100
+#    if "nlb" in s:
+#        return 90
+#    if "nlc" in s:
+#        return 80
+#
+#    # French labels / German labels
+#    # "Ligue 1" .. "Ligue 6"  / "1. Liga" .. "6. Liga"
+#    m = re.search(r"\b(?:ligue|liga)\s*(\d+)\b", s)
+#    if m:
+#        n = int(m.group(1))
+#        # Ligue 1 is higher than Ligue 5 -> invert
+#        return 70 - n  # Ligue 1 -> 69, Ligue 5 -> 65
+#
+#    # fallback
+#    return 0
+#
 
 # -----------------------------
 # Click-tt scraping
@@ -527,7 +561,12 @@ def check_eligibility(
     reasons: List[str] = []
 
     # Determine which teams player has already played for (in this series/contestType)
+#    played_teams = sorted([t for t, n in apps.items() if n > 0])
     played_teams = sorted([t for t, n in apps.items() if n > 0])
+
+# IMPORTANT: nominated team counts as an aligned team even if no appearances yet
+    if nominated_team_no is not None and nominated_team_no not in played_teams:
+        played_teams = sorted(set(played_teams + [nominated_team_no]))
 
     # Map league ranks for Meyrin teams
     lr: Dict[int, int] = {}
