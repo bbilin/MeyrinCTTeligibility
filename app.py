@@ -642,8 +642,8 @@ def check_eligibility(
 st.set_page_config(page_title="Meyrin CTT – Eligibility Checker", layout="wide")
 st.title("Meyrin CTT – Eligibility Checker (50.4.5 / 50.4.6 / 50.4.7)")
 
-teams = fetch_meyrin_teams()
-teams_by_no = {t.team_no: t for t in teams}
+#teams = fetch_meyrin_teams()
+#teams_by_no = {t.team_no: t for t in teams}
 
 def infer_default_phase() -> str:
     # Simple heuristic: Aug-Dec => A, Jan-Jul => B
