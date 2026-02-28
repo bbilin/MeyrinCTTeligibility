@@ -36,9 +36,9 @@ session.headers.update(
 class TeamInfo:
     team_no: int
     name: str
-    league_label: str
-    league_url: str
-
+    league_label: str          # label for selected phase
+    league_url: str            # url for selected phase
+    league_level_rank: int     # phase-agnostic level rank (computed from label)
 
 @dataclass(frozen=True)
 class PlayerPick:
@@ -81,14 +81,12 @@ def _parse_team_no_from_name(name: str) -> Optional[int]:
 
 
 def league_rank(label: str) -> int:
-    """
-    Higher number == higher league.
-    Supports:
-      - NLA/NLB/NLC
-      - "Ligue 5", "Liga 5"
-      - "5ème ligue", "5eme ligue", "5. liga"
-    """
     s = (label or "").lower()
+
+    # strip phase/group noise
+    s = re.sub(r"\bphase\s*[ab]\b", " ", s)
+    s = re.sub(r"\bgr\.?\s*\d+\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
 
     # National leagues
     if "nla" in s:
@@ -102,7 +100,7 @@ def league_rank(label: str) -> int:
     m = re.search(r"\b(?:ligue|liga)\s*(\d+)\b", s)
     if m:
         n = int(m.group(1))
-        return 70 - n  # Ligue 1 higher than Ligue 5
+        return 70 - n
 
     # "5ème ligue" / "5eme ligue" / "5. liga"
     m = re.search(r"\b(\d+)\s*(?:ème|eme|\.|)\s*(?:ligue|liga)\b", s)
@@ -111,6 +109,38 @@ def league_rank(label: str) -> int:
         return 70 - n
 
     return 0
+
+#def league_rank(label: str) -> int:
+#    """
+#    Higher number == higher league.
+#    Supports:
+#      - NLA/NLB/NLC
+#      - "Ligue 5", "Liga 5"
+#      - "5ème ligue", "5eme ligue", "5. liga"
+#    """
+#    s = (label or "").lower()
+#
+#    # National leagues
+#    if "nla" in s:
+#        return 100
+#    if "nlb" in s:
+#        return 90
+#    if "nlc" in s:
+#        return 80
+#
+#    # "Ligue 5" or "Liga 5"
+#    m = re.search(r"\b(?:ligue|liga)\s*(\d+)\b", s)
+#    if m:
+#        n = int(m.group(1))
+#        return 70 - n  # Ligue 1 higher than Ligue 5
+#
+#    # "5ème ligue" / "5eme ligue" / "5. liga"
+#    m = re.search(r"\b(\d+)\s*(?:ème|eme|\.|)\s*(?:ligue|liga)\b", s)
+#    if m:
+#        n = int(m.group(1))
+#        return 70 - n
+#
+#    return 0
 
 
 def roman_to_int(token: str) -> Optional[int]:
@@ -123,18 +153,17 @@ def roman_to_int(token: str) -> Optional[int]:
 # Click-tt scraping
 # -----------------------------
 @st.cache_data(ttl=3600)
-def fetch_meyrin_teams() -> List[TeamInfo]:
+def fetch_meyrin_team_entries() -> Dict[int, List[Tuple[str, str]]]:
     """
-    Parses Meyrin clubTeams page where teams are listed as:
-      Men, Hommes II, Hommes III, ... (plus O40, Jeunesse, Cup, etc.)
-    Keeps only men's teams and returns a normalized name "Meyrin N".
+    Returns dict: team_no -> list of (league_label, league_url) entries.
+    This captures both Phase A and Phase B if present.
     """
     url = f"{BASE}/clubTeams?club={MEYRIN_CLUB_ID}"
     r = session.get(url, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    found: Dict[int, TeamInfo] = {}
+    entries: Dict[int, List[Tuple[str, str]]] = {}
 
     for tr in soup.find_all("tr"):
         tds = tr.find_all("td")
@@ -144,14 +173,8 @@ def fetch_meyrin_teams() -> List[TeamInfo]:
         team_label = _norm(tds[0].get_text(" ", strip=True))
         if not team_label:
             continue
-
         tl = team_label.lower()
         if not (tl.startswith("men") or tl.startswith("hommes") or tl.startswith("herren")):
-            continue
-
-        # Exclude Cup-ish rows
-        league_text = _norm(tds[1].get_text(" ", strip=True)).lower()
-        if "hauptrunde" in league_text or "cup" in league_text:
             continue
 
         # team_no: Men/Hommes/Herren = 1; Hommes II = 2; etc.
@@ -170,13 +193,79 @@ def fetch_meyrin_teams() -> List[TeamInfo]:
         league_label = _norm(a.get_text(" ", strip=True)) if a else _norm(tds[1].get_text(" ", strip=True))
         league_url = _abs_url(a["href"]) if a and a.get("href") else ""
 
-        candidate = TeamInfo(team_no=team_no, name=f"Meyrin {team_no}", league_label=league_label, league_url=league_url)
+        if not league_label:
+            continue
 
-        # Dedup: keep the higher league label if duplicates
-        if team_no not in found or league_rank(candidate.league_label) > league_rank(found[team_no].league_label):
-            found[team_no] = candidate
+        entries.setdefault(team_no, []).append((league_label, league_url))
 
-    return [found[k] for k in sorted(found.keys())]
+    return entries
+
+def pick_phase_entry(options: List[Tuple[str, str]], phase: str) -> Tuple[str, str]:
+    """
+    phase: "A" or "B"
+    Prefer label containing "Phase A"/"Phase B". If not found, fall back to first.
+    """
+    phase_key = f"phase {phase}".lower()
+    for label, url in options:
+        if phase_key in label.lower():
+            return label, url
+    return options[0]
+
+#@st.cache_data(ttl=3600)
+#def fetch_meyrin_teams() -> List[TeamInfo]:
+#    """
+#    Parses Meyrin clubTeams page where teams are listed as:
+#      Men, Hommes II, Hommes III, ... (plus O40, Jeunesse, Cup, etc.)
+#    Keeps only men's teams and returns a normalized name "Meyrin N".
+#    """
+#    url = f"{BASE}/clubTeams?club={MEYRIN_CLUB_ID}"
+#    r = session.get(url, timeout=25)
+#    r.raise_for_status()
+#    soup = BeautifulSoup(r.text, "html.parser")
+#
+#    found: Dict[int, TeamInfo] = {}
+#
+#    for tr in soup.find_all("tr"):
+#        tds = tr.find_all("td")
+#        if len(tds) < 2:
+#            continue
+#
+#        team_label = _norm(tds[0].get_text(" ", strip=True))
+#        if not team_label:
+#            continue
+#
+#        tl = team_label.lower()
+#        if not (tl.startswith("men") or tl.startswith("hommes") or tl.startswith("herren")):
+#            continue
+#
+#        # Exclude Cup-ish rows
+#        league_text = _norm(tds[1].get_text(" ", strip=True)).lower()
+#        if "hauptrunde" in league_text or "cup" in league_text:
+#            continue
+#
+#        # team_no: Men/Hommes/Herren = 1; Hommes II = 2; etc.
+#        team_no = 1
+#        m = re.search(r"\b([ivx]+|\d+)\b$", team_label, flags=re.I)
+#        if m:
+#            tok = m.group(1)
+#            if tok.isdigit():
+#                team_no = int(tok)
+#            else:
+#                val = roman_to_int(tok)
+#                if val:
+#                    team_no = val
+#
+#        a = tds[1].find("a")
+#        league_label = _norm(a.get_text(" ", strip=True)) if a else _norm(tds[1].get_text(" ", strip=True))
+#        league_url = _abs_url(a["href"]) if a and a.get("href") else ""
+#
+#        candidate = TeamInfo(team_no=team_no, name=f"Meyrin {team_no}", league_label=league_label, league_url=league_url)
+#
+#        # Dedup: keep the higher league label if duplicates
+#        if team_no not in found or league_rank(candidate.league_label) > league_rank(found[team_no].league_label):
+#            found[team_no] = candidate
+#
+#    return [found[k] for k in sorted(found.keys())]
 
 
 def search_player_in_meyrin_club(last: str, first: str) -> List[PlayerPick]:
@@ -555,6 +644,39 @@ st.title("Meyrin CTT – Eligibility Checker (50.4.5 / 50.4.6 / 50.4.7)")
 
 teams = fetch_meyrin_teams()
 teams_by_no = {t.team_no: t for t in teams}
+
+def infer_default_phase() -> str:
+    # Simple heuristic: Aug-Dec => A, Jan-Jul => B
+    import datetime
+    m = datetime.date.today().month
+    return "A" if 8 <= m <= 12 else "B"
+
+
+team_entries = fetch_meyrin_team_entries()
+
+with st.sidebar:
+    phase = st.selectbox(
+        "Phase (for dropdown)",
+        options=["A", "B"],
+        index=["A", "B"].index(infer_default_phase())
+    )
+
+teams: List[TeamInfo] = []
+for team_no, opts in sorted(team_entries.items()):
+    label, url = pick_phase_entry(opts, phase)
+    teams.append(
+        TeamInfo(
+            team_no=team_no,
+            name=f"Meyrin {team_no}",
+            league_label=label,
+            league_url=url,
+            league_level_rank=league_rank(label),  # rank ignores phase/group (next section)
+        )
+    )
+
+teams_by_no = {t.team_no: t for t in teams}
+target = st.selectbox("Meyrin team", options=teams, format_func=lambda t: f"{t.name} — {t.league_label}")
+
 
 with st.sidebar:
     st.header("Season / Series")
