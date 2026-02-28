@@ -482,3 +482,16 @@ if st.button("Check eligibility"):
     st.markdown("### Rule reasoning")
     for r in reasons[1:]:
         st.write(f"- {r}")
+
+st.sidebar.markdown("### Debug click-tt access")
+
+if st.sidebar.button("Test click-tt"):
+    try:
+        test_url = f"{BASE}/clubTeams?club={MEYRIN_CLUB_ID}"
+        r = session.get(test_url, timeout=20)
+        st.sidebar.write("Status:", r.status_code)
+        st.sidebar.write("Length:", len(r.text))
+        st.sidebar.text(r.text[:300])
+    except Exception as e:
+        st.sidebar.write("Error:", repr(e))
+
