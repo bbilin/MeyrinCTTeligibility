@@ -352,6 +352,23 @@ def fetch_regular_registration_nominated_team(
 
     return None
 
+def infer_nominated_from_bilans(apps: Dict[int, int], sub_apps: Dict[int, int]) -> Optional[int]:
+    """
+    Heuristic: the 'attached' team is typically the one where the player has appearances
+    AND is NOT marked as substitute (i.e. in apps but not in sub_apps), preferring max apps.
+    """
+    candidates = []
+    for tno, n in apps.items():
+        if n <= 0:
+            continue
+        if tno in sub_apps:
+            continue
+        candidates.append((n, tno))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
 def fetch_bilans_apps(
     season_name: str,
     contest_type_token: str,
@@ -588,6 +605,9 @@ if st.button("Check eligibility"):
     # Scrape nominated team + bilans
     nominated_team_no = fetch_regular_registration_nominated_team(season_name, contest_type, player_key)
     apps, sub_apps = fetch_bilans_apps(season_name, contest_type, player_key)
+
+    if nominated_team_no is None:
+       nominated_team_no = infer_nominated_from_bilans(apps, sub_apps)
 
     ok, reasons = check_eligibility(
         target_team=target,
