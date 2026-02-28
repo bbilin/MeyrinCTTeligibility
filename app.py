@@ -478,6 +478,45 @@ def infer_nominated_from_bilans(apps: Dict[int, int], sub_apps: Dict[int, int]) 
     candidates.sort(reverse=True)
     return candidates[0][1]
 
+def fetch_apps_from_player_portrait(portrait_url: str, teams_by_no: Dict[int, TeamInfo]) -> Tuple[Dict[int, int], Dict[int, int]]:
+    """
+    Extract season appearances from the player portrait page.
+    We look for occurrences of team labels (Men/Hommes VI etc.) and numbers near 'Einsätze'/'Matchs'.
+    This is a heuristic but tends to be more stable than clubPortraitTT tables.
+    """
+    r = session.get(portrait_url, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    text = soup.get_text("\n", strip=True)
+
+    apps: Dict[int, int] = {}
+    sub_apps: Dict[int, int] = {}
+
+    # Build patterns for team labels we know (from clubTeams)
+    # We'll match either "Meyrin 6" or "Hommes VI" etc. if present.
+    team_patterns: List[Tuple[int, re.Pattern]] = []
+    for tno in teams_by_no.keys():
+        # accept "Meyrin 6" plus roman and french forms
+        roman = {1:"I",2:"II",3:"III",4:"IV",5:"V",6:"VI",7:"VII",8:"VIII",9:"IX",10:"X"}.get(tno, str(tno))
+        pat = re.compile(rf"\b(?:Meyrin\s*{tno}|Hommes\s*{roman}|Men\s*{roman}|Herren\s*{roman})\b", re.I)
+        team_patterns.append((tno, pat))
+
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    for i, ln in enumerate(lines):
+        for tno, pat in team_patterns:
+            if pat.search(ln):
+                # Look in the same line and the next 3 lines for an appearances count
+                window = " ".join(lines[i:i+4])
+                # capture something like "Einsätze 1" or "Matchs 1" or "Rencontres 1"
+                m = re.search(r"\b(?:Einsätze|Matchs|Rencontres)\b\D{0,10}(\d+)\b", window, re.I)
+                if m:
+                    apps[tno] = max(apps.get(tno, 0), int(m.group(1)))
+                # some pages mark substitute with "E" / "S" near the team block; try detect it
+                if re.search(r"\b(?:Ersatz|Remplaçant|Substitute)\b", window, re.I):
+                    sub_apps[tno] = apps.get(tno, 0)
+
+    return apps, sub_apps
+
 def fetch_bilans_apps(
     season_name: str,
     contest_type_token: str,
@@ -989,9 +1028,15 @@ if st.button("Check eligibility"):
         # fallback to entered values
         player_key = PlayerKey(last=last.strip(), first=first.strip())
 
-    # Scrape nominated team + bilans
+    # Scrape nominated team
     nominated_team_no = fetch_regular_registration_nominated_team(season_name, contest_type, player_key)
-    apps, sub_apps = fetch_bilans_apps(season_name, contest_type, player_key)
+    
+    # NEW: try portrait-based apps first
+    apps, sub_apps = fetch_apps_from_player_portrait(pick.portrait_url, teams_by_no)
+    
+    # Fallback to clubPortraitTT if portrait didn't give anything
+    if not apps:
+        apps, sub_apps = fetch_bilans_apps(season_name, contest_type, player_key)
 
     if nominated_team_no is None:
        nominated_team_no = infer_nominated_from_bilans(apps, sub_apps)
