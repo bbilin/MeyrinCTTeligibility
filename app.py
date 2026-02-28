@@ -548,25 +548,40 @@ def fetch_bilans_apps(
 #                        tno = team_no_from_label(_norm(first_th.get_text(" ", strip=True)))
 
             # Find a likely header label near this table
-            header_text = ""
-            prev = table.find_previous(["h1", "h2", "h3", "div", "p"])
-            if prev:
-                header_text = _norm(prev.get_text(" ", strip=True))
-            
-            tno = team_no_from_label(header_text)
-            if tno is None:
-                # Alternative: some pages put team label in a table caption or first row th
+            def extract_table_team_label(table) -> str:
+                # 1) caption
                 cap = table.find("caption")
                 if cap:
-                    tno = team_no_from_label(_norm(cap.get_text(" ", strip=True)))
-                if tno is None:
-                    first_th = table.find("th")
-                    if first_th:
-                        tno = team_no_from_label(_norm(first_th.get_text(" ", strip=True)))
-
-
+                    txt = _norm(cap.get_text(" ", strip=True))
+                    if txt:
+                        return txt
+            
+                # 2) first header row (th)
+                first_th = table.find("th")
+                if first_th:
+                    txt = _norm(first_th.get_text(" ", strip=True))
+                    if txt:
+                        return txt
+            
+                # 3) sometimes the team label is in the first row even if not <th>
+                first_tr = table.find("tr")
+                if first_tr:
+                    txt = _norm(first_tr.get_text(" ", strip=True))
+                    if txt:
+                        return txt
+            
+                # 4) last resort: nearest previous heading-like element
+                prev = table.find_previous(["h1", "h2", "h3", "div", "p"])
+                if prev:
+                    return _norm(prev.get_text(" ", strip=True))
+            
+                return ""
+            
+            label = extract_table_team_label(table)
+            tno = team_no_from_label(label)
+            
             if tno is None:
-                continue
+                continue  # cannot assign table to a team confidently
 
             current_team_no = tno
 
