@@ -248,46 +248,109 @@ def infer_player_name_from_portrait(portrait_url: str) -> PlayerKey:
     return PlayerKey(last="", first="")
 
 
+#def fetch_regular_registration_nominated_team(
+#    season_name: str,
+#    contest_type_token: str,
+#    player: PlayerKey,
+#) -> Optional[int]:
+#    """
+#    Returns team_no if player is nominated (inscrit nominativement) in Regular Player Registration.
+#    We scrape clubPools (Regular Player Registrationen und Bilanzen) and look for "X.Y Last, First".
+#    """
+#    url = f"{BASE}/clubPools"
+#    params = {
+#        "club": str(MEYRIN_CLUB_ID),
+#        "contestType": contest_type_token,   # like ${herren}
+#        "displayTyp": "vorrunde",
+#        "preferredLanguage": "German",
+#        "seasonName": season_name,
+#    }
+#    r = session.get(url, params=params, timeout=25)
+#    r.raise_for_status()
+#
+#    soup = BeautifulSoup(r.text, "html.parser")
+#    text = soup.get_text("\n", strip=True)
+#
+#    # match "7.1 Bilin, Bugra" etc
+#    # allow either "Last, First" or "First Last" depending on the page
+#    target1 = f"{player.last}, {player.first}".lower()
+#    target2 = f"{player.first} {player.last}".lower()
+#
+#    for line in text.split("\n"):
+#        s = _norm(line)
+#        m = re.match(r"^(\d+)\.(\d+)\s+(.*)$", s)
+#        if not m:
+#            continue
+#        team_no = int(m.group(1))
+#        rest = m.group(3).lower()
+#        if target1 in rest or target2 in rest:
+#            return team_no
+#
+#    return None
+
 def fetch_regular_registration_nominated_team(
     season_name: str,
     contest_type_token: str,
     player: PlayerKey,
 ) -> Optional[int]:
     """
-    Returns team_no if player is nominated (inscrit nominativement) in Regular Player Registration.
-    We scrape clubPools (Regular Player Registrationen und Bilanzen) and look for "X.Y Last, First".
+    Robustly parses clubPools page tables.
+    Looks for rows with first cell like '7.1' and a name cell containing 'Last, First'.
     """
     url = f"{BASE}/clubPools"
     params = {
         "club": str(MEYRIN_CLUB_ID),
-        "contestType": contest_type_token,   # like ${herren}
+        "contestType": contest_type_token,   # e.g. ${herren}
         "displayTyp": "vorrunde",
         "preferredLanguage": "German",
         "seasonName": season_name,
     }
     r = session.get(url, params=params, timeout=25)
     r.raise_for_status()
-
     soup = BeautifulSoup(r.text, "html.parser")
-    text = soup.get_text("\n", strip=True)
 
-    # match "7.1 Bilin, Bugra" etc
-    # allow either "Last, First" or "First Last" depending on the page
-    target1 = f"{player.last}, {player.first}".lower()
-    target2 = f"{player.first} {player.last}".lower()
+    target_last = player.last.strip().lower()
+    target_first = player.first.strip().lower()
 
-    for line in text.split("\n"):
-        s = _norm(line)
-        m = re.match(r"^(\d+)\.(\d+)\s+(.*)$", s)
-        if not m:
-            continue
-        team_no = int(m.group(1))
-        rest = m.group(3).lower()
-        if target1 in rest or target2 in rest:
-            return team_no
+    # Scan all tables for rank+name patterns
+    for table in soup.find_all("table"):
+        for tr in table.find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 2:
+                continue
+
+            rank_txt = _norm(tds[0].get_text(" ", strip=True))
+            m = re.match(r"^(\d+)\.\d+$", rank_txt)  # '7.1' -> team 7
+            if not m:
+                continue
+            team_no = int(m.group(1))
+
+            name_txt = _norm(tds[1].get_text(" ", strip=True)).lower()
+            # handle "Bilin, Bugra" and "Bugra Bilin"
+            if (target_last in name_txt and target_first in name_txt):
+                return team_no
+
+    # Optional: try Rückrunde too (some seasons only filled there)
+    params["displayTyp"] = "rueckrunde"
+    r = session.get(url, params=params, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    for table in soup.find_all("table"):
+        for tr in table.find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 2:
+                continue
+            rank_txt = _norm(tds[0].get_text(" ", strip=True))
+            m = re.match(r"^(\d+)\.\d+$", rank_txt)
+            if not m:
+                continue
+            team_no = int(m.group(1))
+            name_txt = _norm(tds[1].get_text(" ", strip=True)).lower()
+            if (target_last in name_txt and target_first in name_txt):
+                return team_no
 
     return None
-
 
 def fetch_bilans_apps(
     season_name: str,
