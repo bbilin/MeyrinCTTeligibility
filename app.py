@@ -478,23 +478,42 @@ def infer_nominated_from_bilans(apps: Dict[int, int], sub_apps: Dict[int, int]) 
     candidates.sort(reverse=True)
     return candidates[0][1]
 
-
 def fetch_bilans_apps(
     season_name: str,
     contest_type_token: str,
     player: PlayerKey,
 ) -> Tuple[Dict[int, int], Dict[int, int]]:
     """
-    Returns total appearances across the whole season (both phases).
-    apps[team_no] = total appearances
-    sub_apps[team_no] = appearances as substitute (marker S/E/V row)
+    Click-tt CH bilans page often labels team sections as:
+      Men, Hommes II, Hommes III, ...
+    not "Meyrin 6". This parser handles that.
+
+    Returns totals across the whole season by preferring 'gesamt' and
+    falling back to vorrunde+rueckrunde sums if needed.
     """
+    target_last_first = f"{player.last}, {player.first}".lower()
+    target_first_last = f"{player.first} {player.last}".lower()
+
+    def team_no_from_label(label: str) -> Optional[int]:
+        lab = _norm(label).lower()
+        if not (lab.startswith("men") or lab.startswith("hommes") or lab.startswith("herren")):
+            return None
+        # Men/Hommes/Herren -> 1
+        m = re.search(r"\b([ivx]+|\d+)\b$", lab, flags=re.I)
+        if not m:
+            return 1
+        tok = m.group(1)
+        if tok.isdigit():
+            return int(tok)
+        roman = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10}
+        return roman.get(tok.lower())
+
     def parse_one(display_typ: str) -> Tuple[Dict[int, int], Dict[int, int]]:
         url = f"{BASE}/clubPortraitTT"
         params = {
             "club": str(MEYRIN_CLUB_ID),
             "contestType": contest_type_token,
-            "displayTyp": display_typ,         # "gesamt" OR "vorrunde"/"rueckrunde"
+            "displayTyp": display_typ,
             "preferredLanguage": "German",
             "seasonName": season_name,
         }
@@ -504,44 +523,62 @@ def fetch_bilans_apps(
 
         apps: Dict[int, int] = {}
         sub_apps: Dict[int, int] = {}
+
         current_team_no: Optional[int] = None
 
-        target_last_first = f"{player.last}, {player.first}".lower()
-        target_first_last = f"{player.first} {player.last}".lower()
+        # We scan ALL tables. For each table, try to detect if it belongs to a team by
+        # looking at the closest preceding element's text.
+        tables = soup.find_all("table")
+        for table in tables:
+            # Find a likely header label near this table
+            header_text = ""
+            prev = table.find_previous(["h1", "h2", "h3", "div", "p"])
+            if prev:
+                header_text = _norm(prev.get_text(" ", strip=True))
 
-        for el in soup.find_all(["h1", "h2", "h3", "table"]):
-            if el.name in {"h1", "h2", "h3"}:
-                htxt = _norm(el.get_text(" ", strip=True))
-                if htxt.lower().startswith("meyrin"):
-                    tno = _parse_team_no_from_name(htxt)
-                    if tno:
-                        current_team_no = tno
+            tno = team_no_from_label(header_text)
+            if tno is None:
+                # Alternative: some pages put team label in a table caption or first row th
+                cap = table.find("caption")
+                if cap:
+                    tno = team_no_from_label(_norm(cap.get_text(" ", strip=True)))
+                if tno is None:
+                    first_th = table.find("th")
+                    if first_th:
+                        tno = team_no_from_label(_norm(first_th.get_text(" ", strip=True)))
 
-            if el.name == "table" and current_team_no is not None:
-                for tr in el.find_all("tr"):
-                    tds = tr.find_all("td")
-                    if len(tds) < 2:
-                        continue
-                    row_text = _norm(tr.get_text(" ", strip=True)).lower()
-                    if target_last_first not in row_text and target_first_last not in row_text:
-                        continue
+            if tno is None:
+                continue
 
-                    ints = [int(x) for x in re.findall(r"\b(\d+)\b", tr.get_text(" ", strip=True))]
-                    if not ints:
-                        continue
-                    count = max(ints)
+            current_team_no = tno
 
-                    first_cell = _norm(tds[0].get_text(" ", strip=True)).upper()
-                    apps[current_team_no] = count
-                    if first_cell in SUB_MARKERS:
-                        sub_apps[current_team_no] = count
+            # Parse player rows in this table
+            for tr in table.find_all("tr"):
+                row_text = _norm(tr.get_text(" ", strip=True)).lower()
+                if target_last_first not in row_text and target_first_last not in row_text:
+                    continue
+
+                tds = tr.find_all("td")
+                if not tds:
+                    continue
+
+                # Marker is often in first cell: "S" / "E" / "V" OR "7.1"
+                first_cell = _norm(tds[0].get_text(" ", strip=True)).upper()
+
+                # Extract appearances: take the last integer in the row (usually Einsätze)
+                ints = [int(x) for x in re.findall(r"\b(\d+)\b", tr.get_text(" ", strip=True))]
+                if not ints:
+                    continue
+                count = ints[-1]
+
+                apps[current_team_no] = count
+                if first_cell in SUB_MARKERS:
+                    sub_apps[current_team_no] = count
 
         return apps, sub_apps
 
-    # Try "gesamt" first
+    # Prefer 'gesamt' but be strict: if it returns nothing, fall back to vorrunde+rueckrunde
     apps_g, sub_g = parse_one("gesamt")
-
-    # Also parse both phases and merge as sum (more strict)
     apps_v, sub_v = parse_one("vorrunde")
     apps_r, sub_r = parse_one("rueckrunde")
 
@@ -551,13 +588,94 @@ def fetch_bilans_apps(
             out[k] = out.get(k, 0) + v
         return out
 
-    apps_phases = sum_dicts(apps_v, apps_r)
-    sub_phases = sum_dicts(sub_v, sub_r)
+    apps_ph = sum_dicts(apps_v, apps_r)
+    sub_ph = sum_dicts(sub_v, sub_r)
 
-    # Use whichever has more information (strictest / most complete)
-    if len(apps_phases) >= len(apps_g):
-        return apps_phases, sub_phases
+    # choose most informative
+    if apps_ph and len(apps_ph) >= len(apps_g):
+        return apps_ph, sub_ph
     return apps_g, sub_g
+
+
+#def fetch_bilans_apps(
+#    season_name: str,
+#    contest_type_token: str,
+#    player: PlayerKey,
+#) -> Tuple[Dict[int, int], Dict[int, int]]:
+#    """
+#    Returns total appearances across the whole season (both phases).
+#    apps[team_no] = total appearances
+#    sub_apps[team_no] = appearances as substitute (marker S/E/V row)
+#    """
+#    def parse_one(display_typ: str) -> Tuple[Dict[int, int], Dict[int, int]]:
+#        url = f"{BASE}/clubPortraitTT"
+#        params = {
+#            "club": str(MEYRIN_CLUB_ID),
+#            "contestType": contest_type_token,
+#            "displayTyp": display_typ,         # "gesamt" OR "vorrunde"/"rueckrunde"
+#            "preferredLanguage": "German",
+#            "seasonName": season_name,
+#        }
+#        r = session.get(url, params=params, timeout=25)
+#        r.raise_for_status()
+#        soup = BeautifulSoup(r.text, "html.parser")
+#
+#        apps: Dict[int, int] = {}
+#        sub_apps: Dict[int, int] = {}
+#        current_team_no: Optional[int] = None
+#
+#        target_last_first = f"{player.last}, {player.first}".lower()
+#        target_first_last = f"{player.first} {player.last}".lower()
+#
+#        for el in soup.find_all(["h1", "h2", "h3", "table"]):
+#            if el.name in {"h1", "h2", "h3"}:
+#                htxt = _norm(el.get_text(" ", strip=True))
+#                if htxt.lower().startswith("meyrin"):
+#                    tno = _parse_team_no_from_name(htxt)
+#                    if tno:
+#                        current_team_no = tno
+#
+#            if el.name == "table" and current_team_no is not None:
+#                for tr in el.find_all("tr"):
+#                    tds = tr.find_all("td")
+#                    if len(tds) < 2:
+#                        continue
+#                    row_text = _norm(tr.get_text(" ", strip=True)).lower()
+#                    if target_last_first not in row_text and target_first_last not in row_text:
+#                        continue
+#
+#                    ints = [int(x) for x in re.findall(r"\b(\d+)\b", tr.get_text(" ", strip=True))]
+#                    if not ints:
+#                        continue
+#                    count = max(ints)
+#
+#                    first_cell = _norm(tds[0].get_text(" ", strip=True)).upper()
+#                    apps[current_team_no] = count
+#                    if first_cell in SUB_MARKERS:
+#                        sub_apps[current_team_no] = count
+#
+#        return apps, sub_apps
+#
+#    # Try "gesamt" first
+#    apps_g, sub_g = parse_one("gesamt")
+#
+#    # Also parse both phases and merge as sum (more strict)
+#    apps_v, sub_v = parse_one("vorrunde")
+#    apps_r, sub_r = parse_one("rueckrunde")
+#
+#    def sum_dicts(a: Dict[int, int], b: Dict[int, int]) -> Dict[int, int]:
+#        out = dict(a)
+#        for k, v in b.items():
+#            out[k] = out.get(k, 0) + v
+#        return out
+#
+#    apps_phases = sum_dicts(apps_v, apps_r)
+#    sub_phases = sum_dicts(sub_v, sub_r)
+#
+#    # Use whichever has more information (strictest / most complete)
+#    if len(apps_phases) >= len(apps_g):
+#        return apps_phases, sub_phases
+#    return apps_g, sub_g
 
 #def fetch_bilans_apps(
 #    season_name: str,
@@ -867,6 +985,8 @@ if st.button("Check eligibility"):
         "apps": apps,
         "sub_apps": sub_apps,
         "target_team": f"{target.name} ({target.league_label})",
+        "Bilans found teams:", sorted(apps.keys())
+
     })
 
     st.markdown("### Rule reasoning")
