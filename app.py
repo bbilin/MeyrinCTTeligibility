@@ -99,33 +99,104 @@ def league_rank(label: str) -> int:
 # -----------------------------
 @st.cache_data(ttl=3600)
 def fetch_meyrin_teams() -> List[TeamInfo]:
+    """
+    Parses Meyrin clubTeams page where teams are listed as:
+      Men, Hommes II, Hommes III, ... (plus O40, Jeunesse, Cup, etc.)
+    We keep only men's league teams (Men/Hommes/Herren) and ignore Cup rows.
+    """
     url = f"{BASE}/clubTeams?club={MEYRIN_CLUB_ID}"
     r = session.get(url, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    teams: List[TeamInfo] = []
+    def roman_to_int(token: str) -> Optional[int]:
+        token = token.upper()
+        roman = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
+        return roman.get(token)
+
+    found: Dict[int, TeamInfo] = {}
+
     for tr in soup.find_all("tr"):
         tds = tr.find_all("td")
         if len(tds) < 2:
             continue
-        team_name = _norm(tds[0].get_text(" ", strip=True))
-        if not team_name.lower().startswith("meyrin"):
-            continue
-        team_no = _parse_team_no_from_name(team_name)
-        if team_no is None:
+
+        team_label = _norm(tds[0].get_text(" ", strip=True))
+        if not team_label:
             continue
 
+        tl = team_label.lower()
+        # Keep "Men", "Hommes II", "Herren ..." (but we'll exclude Cup below)
+        if not (tl.startswith("men") or tl.startswith("hommes") or tl.startswith("herren")):
+            continue
+
+        # Exclude Swiss Cup rows ("Hauptrunde", etc.)
+        league_text = _norm(tds[1].get_text(" ", strip=True)).lower()
+        if "hauptrunde" in league_text or "cup" in league_text:
+            continue
+
+        # team_no: Men/Hommes/Herren = 1; Hommes II = 2; etc.
+        team_no = 1
+        m = re.search(r"\b([ivx]+|\d+)\b$", team_label, flags=re.I)
+        if m:
+            tok = m.group(1)
+            if tok.isdigit():
+                team_no = int(tok)
+            else:
+                val = roman_to_int(tok)
+                if val:
+                    team_no = val
+
+        # League label is usually a link in column 2
         a = tds[1].find("a")
         league_label = _norm(a.get_text(" ", strip=True)) if a else _norm(tds[1].get_text(" ", strip=True))
-        teams.append(TeamInfo(team_no=team_no, name=team_name, league_label=league_label))
 
-    # de-dup keep best league_label
-    uniq: Dict[int, TeamInfo] = {}
-    for t in teams:
-        uniq[t.team_no] = t
-    return [uniq[k] for k in sorted(uniq.keys())]
+        # dedupe: keep the "best" league label (by rank) if duplicated Phase A/B rows
+        candidate = TeamInfo(team_no=team_no, name=f"Meyrin {team_no}", league_label=league_label)
+        if team_no not in found or league_rank(candidate.league_label) > league_rank(found[team_no].league_label):
+            found[team_no] = candidate
 
+    return [found[k] for k in sorted(found.keys())]
+
+def search_player_in_meyrin_club(last: str, first: str) -> List[PlayerPick]:
+    """
+    Uses Meyrin 'Licenced players' page which contains direct links to player portraits.
+    Much more reliable than eloFilter on hosted environments.
+    """
+    url = f"{BASE}/clubLicenceMembersPage"
+    params = {"club": str(MEYRIN_CLUB_ID), "preferredLanguage": "German"}
+    r = session.get(url, params=params, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    last_l = last.strip().lower()
+    first_l = first.strip().lower()
+
+    picks: List[PlayerPick] = []
+    for a in soup.find_all("a", href=True):
+        name = _norm(a.get_text(" ", strip=True))
+        if "," not in name:
+            continue
+        # "Bilin, Bugra"
+        n_l = name.lower()
+        if last_l and last_l not in n_l:
+            continue
+        if first_l and first_l not in n_l:
+            continue
+
+        href = a["href"]
+        if "playerPortrait" in href and "person=" in href:
+            picks.append(PlayerPick(display_name=name, portrait_url=_abs_url(href)))
+
+    # de-dup by url
+    seen = set()
+    out = []
+    for p in picks:
+        if p.portrait_url in seen:
+            continue
+        seen.add(p.portrait_url)
+        out.append(p)
+    return out
 
 def search_player_portraits(last: str, first: str) -> List[PlayerPick]:
     """
@@ -433,7 +504,7 @@ if st.button("Check eligibility"):
         st.error("Please enter both last name and first name.")
         st.stop()
 
-    picks = search_player_portraits(last.strip(), first.strip())
+    picks = search_player_in_meyrin_club(last.strip(), first.strip())
     if not picks:
         st.error("No player portraits found via Elo-Filter search. Try different spelling.")
         st.stop()
