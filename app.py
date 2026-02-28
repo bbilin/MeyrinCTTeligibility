@@ -1,3 +1,12 @@
+# app.py
+# Meyrin CTT Eligibility Checker (Swiss click-tt)
+# Implements: 50.4.5 / 50.4.6 / 50.4.7 + strict "no playing down" + strict "lock after 3 subs in higher team"
+# Data sources:
+# - clubTeams for team list + league links
+# - clubLicenceMembersPage for player lookup within Meyrin
+# - clubPools for "nominated team" (regular registration)
+# - team pages (resolved from league/group pages) for appearances (Einsätze) per team (more reliable than clubPortraitTT)
+
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -9,13 +18,16 @@ import streamlit as st
 BASE = "https://www.click-tt.ch/cgi-bin/WebObjects/nuLigaTTCH.woa/wa"
 MEYRIN_CLUB_ID = 33165
 
-# Substitute markers seen on bilans pages (varies by language/competition)
+# Substitute markers (may vary; extend if you see other codes on team pages)
 SUB_MARKERS = {"S", "E", "V"}
+
+ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V", 6: "VI", 7: "VII", 8: "VIII", 9: "IX", 10: "X"}
 
 session = requests.Session()
 session.headers.update(
-    {"User-Agent": "Meyrin-Eligibility-Checker/1.1 (+local tool; no automation; contact club admin)"}
+    {"User-Agent": "Meyrin-Eligibility-Checker/2.0 (+club tool; contact admin if issues)"}
 )
+
 
 # -----------------------------
 # Data models
@@ -25,6 +37,7 @@ class TeamInfo:
     team_no: int
     name: str
     league_label: str
+    league_url: str
 
 
 @dataclass(frozen=True)
@@ -66,16 +79,14 @@ def _parse_team_no_from_name(name: str) -> Optional[int]:
     roman = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
     return roman.get(token)
 
+
 def league_rank(label: str) -> int:
     """
     Higher number == higher league.
-    Supports formats:
-      - "Ligue 5"
-      - "5ème ligue"
-      - "5eme ligue"
-      - "5. Liga"
-      - "Liga 5"
-      - National: NLA/NLB/NLC
+    Supports:
+      - NLA/NLB/NLC
+      - "Ligue 5", "Liga 5"
+      - "5ème ligue", "5eme ligue", "5. liga"
     """
     s = (label or "").lower()
 
@@ -101,32 +112,12 @@ def league_rank(label: str) -> int:
 
     return 0
 
-#def league_rank(label: str) -> int:
-#    """
-#    Higher number == higher league.
-#    Tune mapping if needed.
-#    """
-#    s = (label or "").lower()
-#
-#    # National leagues
-#    if "nla" in s:
-#        return 100
-#    if "nlb" in s:
-#        return 90
-#    if "nlc" in s:
-#        return 80
-#
-#    # French labels / German labels
-#    # "Ligue 1" .. "Ligue 6"  / "1. Liga" .. "6. Liga"
-#    m = re.search(r"\b(?:ligue|liga)\s*(\d+)\b", s)
-#    if m:
-#        n = int(m.group(1))
-#        # Ligue 1 is higher than Ligue 5 -> invert
-#        return 70 - n  # Ligue 1 -> 69, Ligue 5 -> 65
-#
-#    # fallback
-#    return 0
-#
+
+def roman_to_int(token: str) -> Optional[int]:
+    token = token.upper()
+    roman = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
+    return roman.get(token)
+
 
 # -----------------------------
 # Click-tt scraping
@@ -136,17 +127,12 @@ def fetch_meyrin_teams() -> List[TeamInfo]:
     """
     Parses Meyrin clubTeams page where teams are listed as:
       Men, Hommes II, Hommes III, ... (plus O40, Jeunesse, Cup, etc.)
-    We keep only men's league teams (Men/Hommes/Herren) and ignore Cup rows.
+    Keeps only men's teams and returns a normalized name "Meyrin N".
     """
     url = f"{BASE}/clubTeams?club={MEYRIN_CLUB_ID}"
     r = session.get(url, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-
-    def roman_to_int(token: str) -> Optional[int]:
-        token = token.upper()
-        roman = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
-        return roman.get(token)
 
     found: Dict[int, TeamInfo] = {}
 
@@ -160,11 +146,10 @@ def fetch_meyrin_teams() -> List[TeamInfo]:
             continue
 
         tl = team_label.lower()
-        # Keep "Men", "Hommes II", "Herren ..." (but we'll exclude Cup below)
         if not (tl.startswith("men") or tl.startswith("hommes") or tl.startswith("herren")):
             continue
 
-        # Exclude Swiss Cup rows ("Hauptrunde", etc.)
+        # Exclude Cup-ish rows
         league_text = _norm(tds[1].get_text(" ", strip=True)).lower()
         if "hauptrunde" in league_text or "cup" in league_text:
             continue
@@ -181,21 +166,22 @@ def fetch_meyrin_teams() -> List[TeamInfo]:
                 if val:
                     team_no = val
 
-        # League label is usually a link in column 2
         a = tds[1].find("a")
         league_label = _norm(a.get_text(" ", strip=True)) if a else _norm(tds[1].get_text(" ", strip=True))
+        league_url = _abs_url(a["href"]) if a and a.get("href") else ""
 
-        # dedupe: keep the "best" league label (by rank) if duplicated Phase A/B rows
-        candidate = TeamInfo(team_no=team_no, name=f"Meyrin {team_no}", league_label=league_label)
+        candidate = TeamInfo(team_no=team_no, name=f"Meyrin {team_no}", league_label=league_label, league_url=league_url)
+
+        # Dedup: keep the higher league label if duplicates
         if team_no not in found or league_rank(candidate.league_label) > league_rank(found[team_no].league_label):
             found[team_no] = candidate
 
     return [found[k] for k in sorted(found.keys())]
 
+
 def search_player_in_meyrin_club(last: str, first: str) -> List[PlayerPick]:
     """
     Uses Meyrin 'Licenced players' page which contains direct links to player portraits.
-    Much more reliable than eloFilter on hosted environments.
     """
     url = f"{BASE}/clubLicenceMembersPage"
     params = {"club": str(MEYRIN_CLUB_ID), "preferredLanguage": "German"}
@@ -211,44 +197,14 @@ def search_player_in_meyrin_club(last: str, first: str) -> List[PlayerPick]:
         name = _norm(a.get_text(" ", strip=True))
         if "," not in name:
             continue
-        # "Bilin, Bugra"
         n_l = name.lower()
         if last_l and last_l not in n_l:
             continue
         if first_l and first_l not in n_l:
             continue
-
         href = a["href"]
         if "playerPortrait" in href and "person=" in href:
             picks.append(PlayerPick(display_name=name, portrait_url=_abs_url(href)))
-
-    # de-dup by url
-    seen = set()
-    out = []
-    for p in picks:
-        if p.portrait_url in seen:
-            continue
-        seen.add(p.portrait_url)
-        out.append(p)
-    return out
-
-def search_player_portraits(last: str, first: str) -> List[PlayerPick]:
-    """
-    Uses the public Elo-Filter page and extracts playerPortrait links.
-    Param names may change; if click-tt changes it, this function is the only one to adjust.
-    """
-    url = f"{BASE}/eloFilter?federation=STT&preferredLanguage=German"
-    params = {"Nachname": last, "Vorname": first}
-    r = session.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    picks: List[PlayerPick] = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "playerPortrait" in href and "person=" in href:
-            display = _norm(a.get_text(" ", strip=True))
-            picks.append(PlayerPick(display_name=display, portrait_url=_abs_url(href)))
 
     # de-dup by url
     seen = set()
@@ -264,127 +220,19 @@ def search_player_portraits(last: str, first: str) -> List[PlayerPick]:
 def infer_player_name_from_portrait(portrait_url: str) -> PlayerKey:
     """
     Reads playerPortrait and returns (last, first) if possible.
-    We use this to match names against registration/bilans lists.
     """
     r = session.get(portrait_url, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # Usually contains "Lastname, Firstname" somewhere prominent
     text = soup.get_text("\n", strip=True)
-    # heuristic: find first line with comma and two words
-    for line in text.split("\n")[:40]:
-        if "," in line and len(line) < 60:
+    for line in text.split("\n")[:60]:
+        if "," in line and len(line) < 80:
             parts = [p.strip() for p in line.split(",", 1)]
             if len(parts) == 2 and parts[0] and parts[1]:
                 return PlayerKey(last=parts[0], first=parts[1])
-    # fallback: unknown
     return PlayerKey(last="", first="")
 
-
-#def fetch_regular_registration_nominated_team(
-#    season_name: str,
-#    contest_type_token: str,
-#    player: PlayerKey,
-#) -> Optional[int]:
-#    """
-#    Returns team_no if player is nominated (inscrit nominativement) in Regular Player Registration.
-#    We scrape clubPools (Regular Player Registrationen und Bilanzen) and look for "X.Y Last, First".
-#    """
-#    url = f"{BASE}/clubPools"
-#    params = {
-#        "club": str(MEYRIN_CLUB_ID),
-#        "contestType": contest_type_token,   # like ${herren}
-#        "displayTyp": "vorrunde",
-#        "preferredLanguage": "German",
-#        "seasonName": season_name,
-#    }
-#    r = session.get(url, params=params, timeout=25)
-#    r.raise_for_status()
-#
-#    soup = BeautifulSoup(r.text, "html.parser")
-#    text = soup.get_text("\n", strip=True)
-#
-#    # match "7.1 Bilin, Bugra" etc
-#    # allow either "Last, First" or "First Last" depending on the page
-#    target1 = f"{player.last}, {player.first}".lower()
-#    target2 = f"{player.first} {player.last}".lower()
-#
-#    for line in text.split("\n"):
-#        s = _norm(line)
-#        m = re.match(r"^(\d+)\.(\d+)\s+(.*)$", s)
-#        if not m:
-#            continue
-#        team_no = int(m.group(1))
-#        rest = m.group(3).lower()
-#        if target1 in rest or target2 in rest:
-#            return team_no
-#
-#    return None
-
-#def fetch_regular_registration_nominated_team(
-#    season_name: str,
-#    contest_type_token: str,
-#    player: PlayerKey,
-#) -> Optional[int]:
-#    """
-#    Robustly parses clubPools page tables.
-#    Looks for rows with first cell like '7.1' and a name cell containing 'Last, First'.
-#    """
-#    url = f"{BASE}/clubPools"
-#    params = {
-#        "club": str(MEYRIN_CLUB_ID),
-#        "contestType": contest_type_token,   # e.g. ${herren}
-#        "displayTyp": "vorrunde",
-#        "preferredLanguage": "German",
-#        "seasonName": season_name,
-#    }
-#    r = session.get(url, params=params, timeout=25)
-#    r.raise_for_status()
-#    soup = BeautifulSoup(r.text, "html.parser")
-#
-#    target_last = player.last.strip().lower()
-#    target_first = player.first.strip().lower()
-#
-#    # Scan all tables for rank+name patterns
-#    for table in soup.find_all("table"):
-#        for tr in table.find_all("tr"):
-#            tds = tr.find_all("td")
-#            if len(tds) < 2:
-#                continue
-#
-#            rank_txt = _norm(tds[0].get_text(" ", strip=True))
-#            m = re.match(r"^(\d+)\.\d+$", rank_txt)  # '7.1' -> team 7
-#            if not m:
-#                continue
-#            team_no = int(m.group(1))
-#
-#            name_txt = _norm(tds[1].get_text(" ", strip=True)).lower()
-#            # handle "Bilin, Bugra" and "Bugra Bilin"
-#            if (target_last in name_txt and target_first in name_txt):
-#                return team_no
-#
-#    # Optional: try Rückrunde too (some seasons only filled there)
-#    params["displayTyp"] = "rueckrunde"
-#    r = session.get(url, params=params, timeout=25)
-#    r.raise_for_status()
-#    soup = BeautifulSoup(r.text, "html.parser")
-#
-#    for table in soup.find_all("table"):
-#        for tr in table.find_all("tr"):
-#            tds = tr.find_all("td")
-#            if len(tds) < 2:
-#                continue
-#            rank_txt = _norm(tds[0].get_text(" ", strip=True))
-#            m = re.match(r"^(\d+)\.\d+$", rank_txt)
-#            if not m:
-#                continue
-#            team_no = int(m.group(1))
-#            name_txt = _norm(tds[1].get_text(" ", strip=True)).lower()
-#            if (target_last in name_txt and target_first in name_txt):
-#                return team_no
-#
-#    return None
 
 def fetch_regular_registration_nominated_team(
     season_name: str,
@@ -392,40 +240,29 @@ def fetch_regular_registration_nominated_team(
     player: PlayerKey,
 ) -> Optional[int]:
     """
-    Robust:
-    - Tries clubPools page(s)
-    - Scans table rows by finding a rank like '7.1'
-    - Checks FULL ROW text for player name
-    - Tries vorrunde and rueckrunde
-    - If clubPools doesn't contain the table, follows links to groupPools (common in click-tt)
+    Robustly parses clubPools and any linked groupPools pages to find "X.Y Last, First" entries.
+    Returns X as nominated team number.
     """
     target_last = player.last.strip().lower()
     target_first = player.first.strip().lower()
 
-    def row_has_player(tr) -> bool:
-        row_text = _norm(tr.get_text(" ", strip=True)).lower()
-        return (target_last in row_text) and (target_first in row_text)
+    def row_has_player_text(txt: str) -> bool:
+        t = _norm(txt).lower()
+        return target_last in t and target_first in t
 
     def scan_html_for_rank_and_name(html: str) -> Optional[int]:
         soup = BeautifulSoup(html, "html.parser")
-        # Look through ALL rows; if any cell is 'X.Y' and row contains player -> return X
         for tr in soup.find_all("tr"):
-            # quick skip if row doesn't contain player
-            if not row_has_player(tr):
+            row_text = _norm(tr.get_text(" ", strip=True))
+            if not row_has_player_text(row_text):
                 continue
-            # find a rank token like 7.1 anywhere in the row
-            m = re.search(r"\b(\d+)\.\d+\b", _norm(tr.get_text(" ", strip=True)))
+            m = re.search(r"\b(\d+)\.\d+\b", row_text)
             if m:
                 return int(m.group(1))
         return None
 
-    def fetch(url: str, params: dict) -> str:
-        r = session.get(url, params=params, timeout=25)
-        r.raise_for_status()
-        return r.text
-
-    # 1) Try clubPools directly (both halves)
     clubpools_url = f"{BASE}/clubPools"
+
     for display_typ in ("vorrunde", "rueckrunde"):
         params = {
             "club": str(MEYRIN_CLUB_ID),
@@ -434,396 +271,161 @@ def fetch_regular_registration_nominated_team(
             "preferredLanguage": "German",
             "seasonName": season_name,
         }
-        html = fetch(clubpools_url, params)
+        r = session.get(clubpools_url, params=params, timeout=25)
+        r.raise_for_status()
+        html = r.text
+
         team_no = scan_html_for_rank_and_name(html)
         if team_no is not None:
             return team_no
 
-        # 2) If not found, clubPools might just be an index page: follow groupPools links
+        # Follow links to groupPools if clubPools is an index page
         soup = BeautifulSoup(html, "html.parser")
         group_links = []
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            # groupPools pages commonly contain the actual registration table
-            if "groupPools" in href and "displayTyp" in href:
+            if "groupPools" in href:
                 group_links.append(_abs_url(href))
-        # de-dup
         group_links = list(dict.fromkeys(group_links))
 
-        for link in group_links[:30]:  # safety cap
+        for link in group_links[:40]:
             try:
-                sub_html = session.get(link, timeout=25).text
+                r2 = session.get(link, timeout=25)
+                r2.raise_for_status()
             except Exception:
                 continue
-            team_no = scan_html_for_rank_and_name(sub_html)
+            team_no = scan_html_for_rank_and_name(r2.text)
             if team_no is not None:
                 return team_no
 
     return None
 
-def infer_nominated_from_bilans(apps: Dict[int, int], sub_apps: Dict[int, int]) -> Optional[int]:
-    """
-    Heuristic: the 'attached' team is typically the one where the player has appearances
-    AND is NOT marked as substitute (i.e. in apps but not in sub_apps), preferring max apps.
-    """
-    candidates = []
-    for tno, n in apps.items():
-        if n <= 0:
-            continue
-        if tno in sub_apps:
-            continue
-        candidates.append((n, tno))
-    if not candidates:
-        return None
-    candidates.sort(reverse=True)
-    return candidates[0][1]
 
-def fetch_apps_from_player_portrait(portrait_url: str, teams_by_no: Dict[int, TeamInfo]) -> Tuple[Dict[int, int], Dict[int, int]]:
+# -----------------------------
+# Team-page based appearances (reliable)
+# -----------------------------
+def find_team_portrait_url(team: TeamInfo) -> Optional[str]:
     """
-    Extract season appearances from the player portrait page.
-    We look for occurrences of team labels (Men/Hommes VI etc.) and numbers near 'Einsätze'/'Matchs'.
-    This is a heuristic but tends to be more stable than clubPortraitTT tables.
+    Opens the league/group page (team.league_url) and finds the link to the specific team.
+    Then returns the team portrait URL if available (teamPortrait / teamPortraitTT).
     """
-    r = session.get(portrait_url, timeout=25)
+    if not team.league_url:
+        return None
+
+    r = session.get(team.league_url, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-    text = soup.get_text("\n", strip=True)
 
-    apps: Dict[int, int] = {}
-    sub_apps: Dict[int, int] = {}
+    roman = ROMAN.get(team.team_no, str(team.team_no))
+    labels = [
+        f"Meyrin {roman}",
+        f"Meyrin {team.team_no}",
+        f"Hommes {roman}",
+        f"Men {roman}",
+        f"Herren {roman}",
+    ]
 
-    # Build patterns for team labels we know (from clubTeams)
-    # We'll match either "Meyrin 6" or "Hommes VI" etc. if present.
-    team_patterns: List[Tuple[int, re.Pattern]] = []
-    for tno in teams_by_no.keys():
-        # accept "Meyrin 6" plus roman and french forms
-        roman = {1:"I",2:"II",3:"III",4:"IV",5:"V",6:"VI",7:"VII",8:"VIII",9:"IX",10:"X"}.get(tno, str(tno))
-        pat = re.compile(rf"\b(?:Meyrin\s*{tno}|Hommes\s*{roman}|Men\s*{roman}|Herren\s*{roman})\b", re.I)
-        team_patterns.append((tno, pat))
+    team_link = None
+    for a in soup.find_all("a", href=True):
+        txt = _norm(a.get_text(" ", strip=True))
+        for lab in labels:
+            if lab.lower() in txt.lower():
+                team_link = _abs_url(a["href"])
+                break
+        if team_link:
+            break
 
-    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
-    for i, ln in enumerate(lines):
-        for tno, pat in team_patterns:
-            if pat.search(ln):
-                # Look in the same line and the next 3 lines for an appearances count
-                window = " ".join(lines[i:i+4])
-                # capture something like "Einsätze 1" or "Matchs 1" or "Rencontres 1"
-                m = re.search(r"\b(?:Einsätze|Matchs|Rencontres)\b\D{0,10}(\d+)\b", window, re.I)
-                if m:
-                    apps[tno] = max(apps.get(tno, 0), int(m.group(1)))
-                # some pages mark substitute with "E" / "S" near the team block; try detect it
-                if re.search(r"\b(?:Ersatz|Remplaçant|Substitute)\b", window, re.I):
-                    sub_apps[tno] = apps.get(tno, 0)
+    if not team_link:
+        return None
 
-    return apps, sub_apps
+    # Open team page and find teamPortrait link (if any)
+    r2 = session.get(team_link, timeout=25)
+    r2.raise_for_status()
+    soup2 = BeautifulSoup(r2.text, "html.parser")
 
-def fetch_bilans_apps(
-    season_name: str,
-    contest_type_token: str,
-    player: PlayerKey,
-) -> Tuple[Dict[int, int], Dict[int, int]]:
+    for a in soup2.find_all("a", href=True):
+        href = a["href"]
+        if "teamPortrait" in href or "teamPortraitTT" in href:
+            return _abs_url(href)
+
+    if "teamPortrait" in team_link or "teamPortraitTT" in team_link:
+        return team_link
+
+    # As a fallback, sometimes the team_link itself contains a roster table already
+    return team_link
+
+
+def fetch_team_apps_from_team_page(team_page_url: str, player: PlayerKey) -> Tuple[Optional[int], Optional[int]]:
     """
-    Click-tt CH bilans page often labels team sections as:
-      Men, Hommes II, Hommes III, ...
-    not "Meyrin 6". This parser handles that.
-
-    Returns totals across the whole season by preferring 'gesamt' and
-    falling back to vorrunde+rueckrunde sums if needed.
+    Returns (apps, sub_apps) for that specific team.
+    sub_apps is returned if the row is marked as substitute (S/E/V).
     """
+    r = session.get(team_page_url, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
     target_last_first = f"{player.last}, {player.first}".lower()
     target_first_last = f"{player.first} {player.last}".lower()
 
-    def team_no_from_label(label: str) -> Optional[int]:
-        lab = _norm(label).lower()
-        if not (lab.startswith("men") or lab.startswith("hommes") or lab.startswith("herren")):
-            return None
-        # Men/Hommes/Herren -> 1
-        m = re.search(r"\b([ivx]+|\d+)\b$", lab, flags=re.I)
-        if not m:
-            return 1
-        tok = m.group(1)
-        if tok.isdigit():
-            return int(tok)
-        roman = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10}
-        return roman.get(tok.lower())
+    for tr in soup.find_all("tr"):
+        row_text = _norm(tr.get_text(" ", strip=True)).lower()
+        if target_last_first not in row_text and target_first_last not in row_text:
+            continue
 
-    def parse_one(display_typ: str) -> Tuple[Dict[int, int], Dict[int, int]]:
-        url = f"{BASE}/clubPortraitTT"
-        params = {
-            "club": str(MEYRIN_CLUB_ID),
-            "contestType": contest_type_token,
-            "displayTyp": display_typ,
-            "preferredLanguage": "German",
-            "seasonName": season_name,
-        }
-        r = session.get(url, params=params, timeout=25)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+        tds = tr.find_all("td")
+        if not tds:
+            continue
 
-        apps: Dict[int, int] = {}
-        sub_apps: Dict[int, int] = {}
+        first_cell = _norm(tds[0].get_text(" ", strip=True)).upper()
+        ints = [int(x) for x in re.findall(r"\b(\d+)\b", tr.get_text(" ", strip=True))]
+        if not ints:
+            continue
 
-        current_team_no: Optional[int] = None
+        apps = ints[-1]
+        sub = apps if first_cell in SUB_MARKERS else None
+        return apps, sub
 
-        # We scan ALL tables. For each table, try to detect if it belongs to a team by
-        # looking at the closest preceding element's text.
-        tables = soup.find_all("table")
-        for table in tables:
-            # Find a likely header label near this table
-#            header_text = ""
-#            prev = table.find_previous(["h1", "h2", "h3", "div", "p"])
-#            if prev:
-#                header_text = _norm(prev.get_text(" ", strip=True))
-#
-#            tno = team_no_from_label(header_text)
-#            if tno is None:
-#                # Alternative: some pages put team label in a table caption or first row th
-#                cap = table.find("caption")
-#                if cap:
-#                    tno = team_no_from_label(_norm(cap.get_text(" ", strip=True)))
-#                if tno is None:
-#                    first_th = table.find("th")
-#                    if first_th:
-#                        tno = team_no_from_label(_norm(first_th.get_text(" ", strip=True)))
-
-            # Find a likely header label near this table
-            def extract_table_team_label(table) -> str:
-                # 1) caption
-                cap = table.find("caption")
-                if cap:
-                    txt = _norm(cap.get_text(" ", strip=True))
-                    if txt:
-                        return txt
-            
-                # 2) first header row (th)
-                first_th = table.find("th")
-                if first_th:
-                    txt = _norm(first_th.get_text(" ", strip=True))
-                    if txt:
-                        return txt
-            
-                # 3) sometimes the team label is in the first row even if not <th>
-                first_tr = table.find("tr")
-                if first_tr:
-                    txt = _norm(first_tr.get_text(" ", strip=True))
-                    if txt:
-                        return txt
-            
-                # 4) last resort: nearest previous heading-like element
-                prev = table.find_previous(["h1", "h2", "h3", "div", "p"])
-                if prev:
-                    return _norm(prev.get_text(" ", strip=True))
-            
-                return ""
-            
-            label = extract_table_team_label(table)
-            tno = team_no_from_label(label)
-            
-            if tno is None:
-                continue  # cannot assign table to a team confidently
-
-            current_team_no = tno
-
-            # Parse player rows in this table
-            for tr in table.find_all("tr"):
-                row_text = _norm(tr.get_text(" ", strip=True)).lower()
-                if target_last_first not in row_text and target_first_last not in row_text:
-                    continue
-
-                tds = tr.find_all("td")
-                if not tds:
-                    continue
-
-                # Marker is often in first cell: "S" / "E" / "V" OR "7.1"
-                first_cell = _norm(tds[0].get_text(" ", strip=True)).upper()
-
-                # Extract appearances: take the last integer in the row (usually Einsätze)
-                ints = [int(x) for x in re.findall(r"\b(\d+)\b", tr.get_text(" ", strip=True))]
-                if not ints:
-                    continue
-                count = ints[-1]
-
-                apps[current_team_no] = count
-                if first_cell in SUB_MARKERS:
-                    sub_apps[current_team_no] = count
-
-        return apps, sub_apps
-
-    # Prefer 'gesamt' but be strict: if it returns nothing, fall back to vorrunde+rueckrunde
-    apps_g, sub_g = parse_one("gesamt")
-    apps_v, sub_v = parse_one("vorrunde")
-    apps_r, sub_r = parse_one("rueckrunde")
-
-    def sum_dicts(a: Dict[int, int], b: Dict[int, int]) -> Dict[int, int]:
-        out = dict(a)
-        for k, v in b.items():
-            out[k] = out.get(k, 0) + v
-        return out
-
-    apps_ph = sum_dicts(apps_v, apps_r)
-    sub_ph = sum_dicts(sub_v, sub_r)
-
-    # choose most informative
-    if apps_ph and len(apps_ph) >= len(apps_g):
-        return apps_ph, sub_ph
-    return apps_g, sub_g
+    return None, None
 
 
-#def fetch_bilans_apps(
-#    season_name: str,
-#    contest_type_token: str,
-#    player: PlayerKey,
-#) -> Tuple[Dict[int, int], Dict[int, int]]:
-#    """
-#    Returns total appearances across the whole season (both phases).
-#    apps[team_no] = total appearances
-#    sub_apps[team_no] = appearances as substitute (marker S/E/V row)
-#    """
-#    def parse_one(display_typ: str) -> Tuple[Dict[int, int], Dict[int, int]]:
-#        url = f"{BASE}/clubPortraitTT"
-#        params = {
-#            "club": str(MEYRIN_CLUB_ID),
-#            "contestType": contest_type_token,
-#            "displayTyp": display_typ,         # "gesamt" OR "vorrunde"/"rueckrunde"
-#            "preferredLanguage": "German",
-#            "seasonName": season_name,
-#        }
-#        r = session.get(url, params=params, timeout=25)
-#        r.raise_for_status()
-#        soup = BeautifulSoup(r.text, "html.parser")
-#
-#        apps: Dict[int, int] = {}
-#        sub_apps: Dict[int, int] = {}
-#        current_team_no: Optional[int] = None
-#
-#        target_last_first = f"{player.last}, {player.first}".lower()
-#        target_first_last = f"{player.first} {player.last}".lower()
-#
-#        for el in soup.find_all(["h1", "h2", "h3", "table"]):
-#            if el.name in {"h1", "h2", "h3"}:
-#                htxt = _norm(el.get_text(" ", strip=True))
-#                if htxt.lower().startswith("meyrin"):
-#                    tno = _parse_team_no_from_name(htxt)
-#                    if tno:
-#                        current_team_no = tno
-#
-#            if el.name == "table" and current_team_no is not None:
-#                for tr in el.find_all("tr"):
-#                    tds = tr.find_all("td")
-#                    if len(tds) < 2:
-#                        continue
-#                    row_text = _norm(tr.get_text(" ", strip=True)).lower()
-#                    if target_last_first not in row_text and target_first_last not in row_text:
-#                        continue
-#
-#                    ints = [int(x) for x in re.findall(r"\b(\d+)\b", tr.get_text(" ", strip=True))]
-#                    if not ints:
-#                        continue
-#                    count = max(ints)
-#
-#                    first_cell = _norm(tds[0].get_text(" ", strip=True)).upper()
-#                    apps[current_team_no] = count
-#                    if first_cell in SUB_MARKERS:
-#                        sub_apps[current_team_no] = count
-#
-#        return apps, sub_apps
-#
-#    # Try "gesamt" first
-#    apps_g, sub_g = parse_one("gesamt")
-#
-#    # Also parse both phases and merge as sum (more strict)
-#    apps_v, sub_v = parse_one("vorrunde")
-#    apps_r, sub_r = parse_one("rueckrunde")
-#
-#    def sum_dicts(a: Dict[int, int], b: Dict[int, int]) -> Dict[int, int]:
-#        out = dict(a)
-#        for k, v in b.items():
-#            out[k] = out.get(k, 0) + v
-#        return out
-#
-#    apps_phases = sum_dicts(apps_v, apps_r)
-#    sub_phases = sum_dicts(sub_v, sub_r)
-#
-#    # Use whichever has more information (strictest / most complete)
-#    if len(apps_phases) >= len(apps_g):
-#        return apps_phases, sub_phases
-#    return apps_g, sub_g
+def fetch_apps_via_team_pages(
+    player: PlayerKey,
+    nominated_team_no: Optional[int],
+    target_team: TeamInfo,
+    teams_by_no: Dict[int, TeamInfo],
+) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, str]]:
+    """
+    Queries only the nominated team and target team pages.
+    Returns:
+      apps, sub_apps, debug_team_pages (team_no->url used)
+    """
+    apps: Dict[int, int] = {}
+    sub_apps: Dict[int, int] = {}
+    debug_team_pages: Dict[int, str] = {}
 
-#def fetch_bilans_apps(
-#    season_name: str,
-#    contest_type_token: str,
-#    player: PlayerKey,
-#) -> Tuple[Dict[int, int], Dict[int, int]]:
-#    """
-#    Returns:
-#      apps[team_no] = total Einsätze for player in that team
-#      sub_apps[team_no] = Einsätze counted as substitute in that team (row starts with S/E/V)
-#    """
-#    url = f"{BASE}/clubPortraitTT"
-#    params = {
-#        "club": str(MEYRIN_CLUB_ID),
-#        "contestType": contest_type_token,
-#        "displayTyp": "gesamt",
-#        "preferredLanguage": "German",
-#        "seasonName": season_name,
-#    }
-#    r = session.get(url, params=params, timeout=25)
-#    r.raise_for_status()
-#    soup = BeautifulSoup(r.text, "html.parser")
-#
-#    # Strategy: walk headings and tables; identify which team section we're in by "Meyrin VI" heading text.
-#    apps: Dict[int, int] = {}
-#    sub_apps: Dict[int, int] = {}
-#
-#    # Build a flat list of elements in order, tracking current team_no
-#    current_team_no: Optional[int] = None
-#
-#    # target name patterns
-#    target_last_first = f"{player.last}, {player.first}".lower()
-#    target_first_last = f"{player.first} {player.last}".lower()
-#
-#    for el in soup.find_all(["h1", "h2", "h3", "table"]):
-#        if el.name in {"h1", "h2", "h3"}:
-#            htxt = _norm(el.get_text(" ", strip=True))
-#            if htxt.lower().startswith("meyrin"):
-#                tno = _parse_team_no_from_name(htxt)
-#                if tno:
-#                    current_team_no = tno
-#
-#        if el.name == "table" and current_team_no is not None:
-#            # parse rows
-#            for tr in el.find_all("tr"):
-#                tds = tr.find_all("td")
-#                if len(tds) < 2:
-#                    continue
-#                row_text = _norm(tr.get_text(" ", strip=True)).lower()
-#                if target_last_first not in row_text and target_first_last not in row_text:
-#                    continue
-#
-#                # Try find "Einsätze" number anywhere in row
-#                # Commonly the last numeric field; take max integer found
-#                ints = [int(x) for x in re.findall(r"\b(\d+)\b", tr.get_text(" ", strip=True))]
-#                if not ints:
-#                    continue
-#                count = max(ints)
-#
-#                # Determine marker: first cell might be "7.1" (regular) or "S" / "E" / "V"
-#                first_cell = _norm(tds[0].get_text(" ", strip=True))
-#                marker = first_cell.upper()
-#
-#                apps[current_team_no] = count
-#                if marker in SUB_MARKERS:
-#                    sub_apps[current_team_no] = count
-#
-#    return apps, sub_apps
-#
-def best_team_rank(team_no: int, teams_by_no: Dict[int, TeamInfo]) -> int:
-    info = teams_by_no.get(team_no)
-    return league_rank(info.league_label) if info else 0
+    team_nos: List[int] = []
+    if nominated_team_no is not None and nominated_team_no in teams_by_no:
+        team_nos.append(nominated_team_no)
+    if target_team.team_no in teams_by_no and target_team.team_no not in team_nos:
+        team_nos.append(target_team.team_no)
+
+    for tno in team_nos:
+        team = teams_by_no[tno]
+        team_page = find_team_portrait_url(team)
+        if not team_page:
+            continue
+        debug_team_pages[tno] = team_page
+        a, s = fetch_team_apps_from_team_page(team_page, player)
+        if a is not None:
+            apps[tno] = a
+        if s is not None:
+            sub_apps[tno] = s
+
+    return apps, sub_apps, debug_team_pages
 
 
 # -----------------------------
-# Rules engine: 50.4.5 / 50.4.6 / 50.4.7
+# Rules engine (strict season behavior)
 # -----------------------------
 def check_eligibility(
     target_team: TeamInfo,
@@ -835,106 +437,90 @@ def check_eligibility(
 
     reasons: List[str] = []
 
-    # Determine which teams player has already played for (in this series/contestType)
-#    played_teams = sorted([t for t, n in apps.items() if n > 0])
-    played_teams = sorted([t for t, n in apps.items() if n > 0])
-
-# IMPORTANT: nominated team counts as an aligned team even if no appearances yet
-    if nominated_team_no is not None and nominated_team_no not in played_teams:
-        played_teams = sorted(set(played_teams + [nominated_team_no]))
-
-    # Map league ranks for Meyrin teams
-    lr: Dict[int, int] = {}
-    for tno, info in teams_by_no.items():
-        lr[tno] = league_rank(info.league_label)
-
-    # lowest team in this contestType among Meyrin teams
-    # (lowest rank -> smallest value)
-    lowest_team_no = min(lr.keys(), key=lambda k: lr[k]) if lr else target_team.team_no
+    # league ranks for all Meyrin teams
+    lr: Dict[int, int] = {tno: league_rank(info.league_label) for tno, info in teams_by_no.items()}
 
     def higher(a: int, b: int) -> bool:
         return lr.get(a, 0) > lr.get(b, 0)
 
-# ---- Strict: lock to a higher team after 3 substitute alignments there (50.4.6) ----
+    # Determine aligned teams in this season: appearances + nominated team
+    played_teams = sorted([t for t, n in apps.items() if n > 0])
+    if nominated_team_no is not None:
+        played_teams = sorted(set(played_teams + [nominated_team_no]))
+
+    # ---- Strict lock: 3 substitute appearances in a higher team -> locked to that team ----
     locked_team_no: Optional[int] = None
-    
     if nominated_team_no is not None:
         base = nominated_team_no
-        # If player has 3+ substitute appearances in ANY higher team, they are locked to that higher team
-        higher_teams = [tno for tno in sub_apps.keys() if higher(tno, base)]
-        for tno in higher_teams:
-            if sub_apps.get(tno, 0) >= 3:
-                # if multiple, lock to the highest league among them (safest)
+        for tno, nsubs in sub_apps.items():
+            if higher(tno, base) and nsubs >= 3:
                 if locked_team_no is None or lr.get(tno, 0) > lr.get(locked_team_no, 0):
                     locked_team_no = tno
-    
+
     if locked_team_no is not None and target_team.team_no != locked_team_no:
         return False, [
-            "NOT ELIGIBLE (50.4.6 strict): player became titulaire in a higher team after 3 substitute matches and is locked to that team.",
-            f"Locked team: {locked_team_no} ({teams_by_no[locked_team_no].league_label}). Target: {target_team.team_no} ({target_team.league_label})."
+            "NOT ELIGIBLE (strict lock): player became titulaire in a higher team after 3 substitute matches and is locked to that team.",
+            f"Locked team: {locked_team_no} ({teams_by_no[locked_team_no].league_label}). Target: {target_team.team_no} ({target_team.league_label}).",
         ]
 
-# ---- Strict: if player is aligned in a higher league team this season, they cannot play down ----
+    # ---- Strict no playing down: if aligned (nominated or played) in higher league -> cannot play in lower league ----
     target_rank = lr.get(target_team.team_no, 0)
-    
-    # Consider nominated team as "aligned"
+
     if nominated_team_no is not None and lr.get(nominated_team_no, 0) > target_rank:
         return False, [
             "NOT ELIGIBLE (strict no playing down): player is nominated in a higher league team for this season.",
-            f"Nominated team: {nominated_team_no} ({teams_by_no[nominated_team_no].league_label}) > Target: {target_team.team_no} ({target_team.league_label})."
+            f"Nominated team: {nominated_team_no} ({teams_by_no[nominated_team_no].league_label}) > Target: {target_team.team_no} ({target_team.league_label}).",
         ]
-    
-    # Consider any higher team already played this season (both phases, because apps were summed)
+
     for tno in played_teams:
         if lr.get(tno, 0) > target_rank:
             return False, [
                 "NOT ELIGIBLE (strict no playing down): player has already played in a higher league team this season.",
-                f"Higher team played: {tno} ({teams_by_no[tno].league_label}) > Target: {target_team.team_no} ({target_team.league_label})."
+                f"Higher team played: {tno} ({teams_by_no[tno].league_label}) > Target: {target_team.team_no} ({target_team.league_label}).",
             ]
 
-    # ---- 50.4.5: max two teams AND in different leagues ----
-    # prospective teams if we add target team
+    # ---- 50.4.5: at most two teams, and must be in different leagues ----
     prospective = sorted(set(played_teams + [target_team.team_no]))
     if len(prospective) > 2:
         return False, [
-            "NOT ELIGIBLE (50.4.5): a player may be aligned in at most two teams.",
-            f"Already played for teams {played_teams}; adding team {target_team.team_no} would make {prospective}."
+            "NOT ELIGIBLE (50.4.5): a player may be aligned in at most two teams (season-wide, both phases).",
+            f"Already aligned teams: {played_teams}; adding team {target_team.team_no} would make {prospective}.",
         ]
 
     if len(prospective) == 2:
         t1, t2 = prospective
-        l1 = teams_by_no.get(t1).league_label if t1 in teams_by_no else "?"
-        l2 = teams_by_no.get(t2).league_label if t2 in teams_by_no else "?"
+        l1 = teams_by_no[t1].league_label if t1 in teams_by_no else "?"
+        l2 = teams_by_no[t2].league_label if t2 in teams_by_no else "?"
         if league_rank(l1) == league_rank(l2):
             return False, [
-                "NOT ELIGIBLE (50.4.5): the two teams must be in different leagues.",
-                f"Teams would be {t1} ({l1}) and {t2} ({l2}) which are the same league level."
+                "NOT ELIGIBLE (50.4.5): if two teams, they must be in different leagues.",
+                f"Teams would be {t1} ({l1}) and {t2} ({l2}) which are the same league level.",
             ]
 
     reasons.append("Passed 50.4.5 (max two teams, different leagues).")
 
-    # Helper: if this appearance is a substitute appearance in target team (generally yes unless nominated there)
+    # Helper for substitute count in target team (based on what we found)
     def next_sub_count(team_no: int) -> int:
         return sub_apps.get(team_no, 0) + 1
 
-    # ---- 50.4.7 (special): non-nominated, first appearance in lowest team -> becomes titulaire immediately ----
+    # ---- 50.4.7: non-nominated + first appearance in lowest team -> titulaire immediately ----
+    lowest_team_no = min(lr.keys(), key=lambda k: lr[k]) if lr else target_team.team_no
+
     if nominated_team_no is None:
-        if apps.get(lowest_team_no, 0) >= 1:
-            # already became titulaire in lowest team from first alignment (50.4.7)
-            reasons.append(f"50.4.7 applies: player has appeared in lowest team {lowest_team_no}, thus is titulaire there.")
-        # If target is lowest and would be first appearance: becoming titulaire is allowed (no prohibition).
         if target_team.team_no == lowest_team_no and apps.get(lowest_team_no, 0) == 0:
             reasons.append(f"50.4.7: first alignment in lowest team {lowest_team_no} makes player titulaire there.")
             return True, ["ELIGIBLE"] + reasons
 
-    # ---- 50.4.6 (nominated case): substitute in higher league max 2; 3rd makes titulaire there ----
+    # ---- 50.4.6 nominated case ----
     if nominated_team_no is not None:
         base = nominated_team_no
         if target_team.team_no == base:
-            reasons.append(f"Player is nominated in team {base}; playing there is always OK under these articles.")
+            reasons.append(f"Player is nominated in team {base}.")
             return True, ["ELIGIBLE"] + reasons
 
         if higher(target_team.team_no, base):
+            if not apps and not sub_apps:
+                reasons.append("Warning: could not find season appearances on click-tt; assuming 0 prior substitute matches.")
             n = next_sub_count(target_team.team_no)
             if n <= 2:
                 reasons.append(
@@ -943,26 +529,21 @@ def check_eligibility(
                 return True, ["ELIGIBLE"] + reasons
             else:
                 reasons.append(
-                    f"50.4.6: this is substitute appearance #{n} in higher team {target_team.team_no}; "
-                    f"player becomes titulaire of the higher team and must then play only for that team in this series."
+                    f"50.4.6: this is substitute appearance #{n} in higher team {target_team.team_no}; player becomes titulaire there and is then locked to that team."
                 )
-                return True, ["ELIGIBLE (but triggers titular lock to higher team)"] + reasons
+                return True, ["ELIGIBLE (but triggers titular lock)"] + reasons
 
-        # Same or lower league than base: 50.4.6 does not add a restriction here.
-        reasons.append("50.4.6: target team is not a higher league than the nominated team; no extra restriction here.")
+        reasons.append("50.4.6: target team is not a higher league than nominated team; no extra restriction here.")
         return True, ["ELIGIBLE"] + reasons
 
-    # ---- 50.4.6 (non-nominated): can be aligned in two teams of different leagues; 3rd appearance in one -> titulaire there ----
-    # (50.4.5 already enforced max 2 teams and different leagues)
+    # ---- 50.4.6 non-nominated ----
     current_apps = apps.get(target_team.team_no, 0)
     n_after = current_apps + 1
     if n_after >= 3:
-        reasons.append(
-            f"50.4.6: this would be appearance #{n_after} in team {target_team.team_no}; player becomes titulaire of that team."
-        )
+        reasons.append(f"50.4.6: this would be appearance #{n_after} in team {target_team.team_no}; player becomes titulaire of that team.")
         return True, ["ELIGIBLE (but becomes titulaire of the team)"] + reasons
 
-    reasons.append(f"50.4.6: not nominated; this would be appearance #{n_after} in team {target_team.team_no} (still within substitute limits).")
+    reasons.append(f"50.4.6: not nominated; this would be appearance #{n_after} in team {target_team.team_no}.")
     return True, ["ELIGIBLE"] + reasons
 
 
@@ -978,7 +559,6 @@ teams_by_no = {t.team_no: t for t in teams}
 with st.sidebar:
     st.header("Season / Series")
     season_name = st.text_input("Season (format 2025/26)", value="2025/26")
-
     contest_type = st.selectbox(
         "Series (contestType)",
         options=[
@@ -994,7 +574,22 @@ with st.sidebar:
     )[1]
 
     st.header("Target team")
-    target = st.selectbox("Meyrin team", options=teams, format_func=lambda t: f"{t.name} — {t.league_label}")
+    if teams:
+        target = st.selectbox("Meyrin team", options=teams, format_func=lambda t: f"{t.name} — {t.league_label}")
+    else:
+        st.error("No teams found. Check click-tt connectivity.")
+        st.stop()
+
+    st.markdown("### Debug")
+    if st.button("Test click-tt"):
+        test_url = f"{BASE}/clubTeams?club={MEYRIN_CLUB_ID}"
+        try:
+            resp = session.get(test_url, timeout=20)
+            st.write("Status:", resp.status_code)
+            st.write("Length:", len(resp.text))
+            st.text(resp.text[:300])
+        except Exception as e:
+            st.write("Request failed:", repr(e))
 
 st.divider()
 st.subheader("Player")
@@ -1012,7 +607,7 @@ if st.button("Check eligibility"):
 
     picks = search_player_in_meyrin_club(last.strip(), first.strip())
     if not picks:
-        st.error("No player portraits found via Elo-Filter search. Try different spelling.")
+        st.error("Player not found in Meyrin licensed players list.")
         st.stop()
 
     pick = picks[0]
@@ -1020,26 +615,17 @@ if st.button("Check eligibility"):
         pick = st.radio(
             "Multiple matches found — pick one:",
             options=picks,
-            format_func=lambda p: f"{p.display_name} — {p.portrait_url}",
+            format_func=lambda p: f"{p.display_name}",
         )
 
     player_key = infer_player_name_from_portrait(pick.portrait_url)
     if not player_key.last or not player_key.first:
-        # fallback to entered values
         player_key = PlayerKey(last=last.strip(), first=first.strip())
 
-    # Scrape nominated team
     nominated_team_no = fetch_regular_registration_nominated_team(season_name, contest_type, player_key)
-    
-    # NEW: try portrait-based apps first
-    apps, sub_apps = fetch_apps_from_player_portrait(pick.portrait_url, teams_by_no)
-    
-    # Fallback to clubPortraitTT if portrait didn't give anything
-    if not apps:
-        apps, sub_apps = fetch_bilans_apps(season_name, contest_type, player_key)
 
-    if nominated_team_no is None:
-       nominated_team_no = infer_nominated_from_bilans(apps, sub_apps)
+    # NEW: fetch appearances via nominated+target team pages
+    apps, sub_apps, debug_team_pages = fetch_apps_via_team_pages(player_key, nominated_team_no, target, teams_by_no)
 
     ok, reasons = check_eligibility(
         target_team=target,
@@ -1056,30 +642,22 @@ if st.button("Check eligibility"):
         st.error(reasons[0])
 
     st.markdown("### Details")
-    st.write({
-        "player": f"{player_key.last}, {player_key.first}",
-        "portrait": pick.portrait_url,
-        "nominated_team_no": nominated_team_no,
-        "apps": apps,
-        "sub_apps": sub_apps,
-        "target_team": f"{target.name} ({target.league_label})",
-        "Bilans found teams":sorted(apps.keys())
+    st.write(
+        {
+            "player": f"{player_key.last}, {player_key.first}",
+            "portrait": pick.portrait_url,
+            "nominated_team_no": nominated_team_no,
+            "apps": apps,
+            "sub_apps": sub_apps,
+            "target_team": f"{target.name} ({target.league_label})",
+            "Bilans found teams": sorted(apps.keys()),
+            "team_pages_used": debug_team_pages,
+        }
+    )
 
-    })
+    if not apps and not sub_apps:
+        st.warning("Could not find season appearances on click-tt team pages; result may be incomplete.")
 
     st.markdown("### Rule reasoning")
     for r in reasons[1:]:
         st.write(f"- {r}")
-
-st.sidebar.markdown("### Debug click-tt access")
-
-if st.sidebar.button("Test click-tt"):
-    try:
-        test_url = f"{BASE}/clubTeams?club={MEYRIN_CLUB_ID}"
-        r = session.get(test_url, timeout=20)
-        st.sidebar.write("Status:", r.status_code)
-        st.sidebar.write("Length:", len(r.text))
-        st.sidebar.text(r.text[:300])
-    except Exception as e:
-        st.sidebar.write("Error:", repr(e))
-
