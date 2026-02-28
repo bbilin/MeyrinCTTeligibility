@@ -478,73 +478,158 @@ def infer_nominated_from_bilans(apps: Dict[int, int], sub_apps: Dict[int, int]) 
     candidates.sort(reverse=True)
     return candidates[0][1]
 
+
 def fetch_bilans_apps(
     season_name: str,
     contest_type_token: str,
     player: PlayerKey,
 ) -> Tuple[Dict[int, int], Dict[int, int]]:
     """
-    Returns:
-      apps[team_no] = total Einsätze for player in that team
-      sub_apps[team_no] = Einsätze counted as substitute in that team (row starts with S/E/V)
+    Returns total appearances across the whole season (both phases).
+    apps[team_no] = total appearances
+    sub_apps[team_no] = appearances as substitute (marker S/E/V row)
     """
-    url = f"{BASE}/clubPortraitTT"
-    params = {
-        "club": str(MEYRIN_CLUB_ID),
-        "contestType": contest_type_token,
-        "displayTyp": "gesamt",
-        "preferredLanguage": "German",
-        "seasonName": season_name,
-    }
-    r = session.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+    def parse_one(display_typ: str) -> Tuple[Dict[int, int], Dict[int, int]]:
+        url = f"{BASE}/clubPortraitTT"
+        params = {
+            "club": str(MEYRIN_CLUB_ID),
+            "contestType": contest_type_token,
+            "displayTyp": display_typ,         # "gesamt" OR "vorrunde"/"rueckrunde"
+            "preferredLanguage": "German",
+            "seasonName": season_name,
+        }
+        r = session.get(url, params=params, timeout=25)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    # Strategy: walk headings and tables; identify which team section we're in by "Meyrin VI" heading text.
-    apps: Dict[int, int] = {}
-    sub_apps: Dict[int, int] = {}
+        apps: Dict[int, int] = {}
+        sub_apps: Dict[int, int] = {}
+        current_team_no: Optional[int] = None
 
-    # Build a flat list of elements in order, tracking current team_no
-    current_team_no: Optional[int] = None
+        target_last_first = f"{player.last}, {player.first}".lower()
+        target_first_last = f"{player.first} {player.last}".lower()
 
-    # target name patterns
-    target_last_first = f"{player.last}, {player.first}".lower()
-    target_first_last = f"{player.first} {player.last}".lower()
+        for el in soup.find_all(["h1", "h2", "h3", "table"]):
+            if el.name in {"h1", "h2", "h3"}:
+                htxt = _norm(el.get_text(" ", strip=True))
+                if htxt.lower().startswith("meyrin"):
+                    tno = _parse_team_no_from_name(htxt)
+                    if tno:
+                        current_team_no = tno
 
-    for el in soup.find_all(["h1", "h2", "h3", "table"]):
-        if el.name in {"h1", "h2", "h3"}:
-            htxt = _norm(el.get_text(" ", strip=True))
-            if htxt.lower().startswith("meyrin"):
-                tno = _parse_team_no_from_name(htxt)
-                if tno:
-                    current_team_no = tno
+            if el.name == "table" and current_team_no is not None:
+                for tr in el.find_all("tr"):
+                    tds = tr.find_all("td")
+                    if len(tds) < 2:
+                        continue
+                    row_text = _norm(tr.get_text(" ", strip=True)).lower()
+                    if target_last_first not in row_text and target_first_last not in row_text:
+                        continue
 
-        if el.name == "table" and current_team_no is not None:
-            # parse rows
-            for tr in el.find_all("tr"):
-                tds = tr.find_all("td")
-                if len(tds) < 2:
-                    continue
-                row_text = _norm(tr.get_text(" ", strip=True)).lower()
-                if target_last_first not in row_text and target_first_last not in row_text:
-                    continue
+                    ints = [int(x) for x in re.findall(r"\b(\d+)\b", tr.get_text(" ", strip=True))]
+                    if not ints:
+                        continue
+                    count = max(ints)
 
-                # Try find "Einsätze" number anywhere in row
-                # Commonly the last numeric field; take max integer found
-                ints = [int(x) for x in re.findall(r"\b(\d+)\b", tr.get_text(" ", strip=True))]
-                if not ints:
-                    continue
-                count = max(ints)
+                    first_cell = _norm(tds[0].get_text(" ", strip=True)).upper()
+                    apps[current_team_no] = count
+                    if first_cell in SUB_MARKERS:
+                        sub_apps[current_team_no] = count
 
-                # Determine marker: first cell might be "7.1" (regular) or "S" / "E" / "V"
-                first_cell = _norm(tds[0].get_text(" ", strip=True))
-                marker = first_cell.upper()
+        return apps, sub_apps
 
-                apps[current_team_no] = count
-                if marker in SUB_MARKERS:
-                    sub_apps[current_team_no] = count
+    # Try "gesamt" first
+    apps_g, sub_g = parse_one("gesamt")
 
-    return apps, sub_apps
+    # Also parse both phases and merge as sum (more strict)
+    apps_v, sub_v = parse_one("vorrunde")
+    apps_r, sub_r = parse_one("rueckrunde")
+
+    def sum_dicts(a: Dict[int, int], b: Dict[int, int]) -> Dict[int, int]:
+        out = dict(a)
+        for k, v in b.items():
+            out[k] = out.get(k, 0) + v
+        return out
+
+    apps_phases = sum_dicts(apps_v, apps_r)
+    sub_phases = sum_dicts(sub_v, sub_r)
+
+    # Use whichever has more information (strictest / most complete)
+    if len(apps_phases) >= len(apps_g):
+        return apps_phases, sub_phases
+    return apps_g, sub_g
+
+#def fetch_bilans_apps(
+#    season_name: str,
+#    contest_type_token: str,
+#    player: PlayerKey,
+#) -> Tuple[Dict[int, int], Dict[int, int]]:
+#    """
+#    Returns:
+#      apps[team_no] = total Einsätze for player in that team
+#      sub_apps[team_no] = Einsätze counted as substitute in that team (row starts with S/E/V)
+#    """
+#    url = f"{BASE}/clubPortraitTT"
+#    params = {
+#        "club": str(MEYRIN_CLUB_ID),
+#        "contestType": contest_type_token,
+#        "displayTyp": "gesamt",
+#        "preferredLanguage": "German",
+#        "seasonName": season_name,
+#    }
+#    r = session.get(url, params=params, timeout=25)
+#    r.raise_for_status()
+#    soup = BeautifulSoup(r.text, "html.parser")
+#
+#    # Strategy: walk headings and tables; identify which team section we're in by "Meyrin VI" heading text.
+#    apps: Dict[int, int] = {}
+#    sub_apps: Dict[int, int] = {}
+#
+#    # Build a flat list of elements in order, tracking current team_no
+#    current_team_no: Optional[int] = None
+#
+#    # target name patterns
+#    target_last_first = f"{player.last}, {player.first}".lower()
+#    target_first_last = f"{player.first} {player.last}".lower()
+#
+#    for el in soup.find_all(["h1", "h2", "h3", "table"]):
+#        if el.name in {"h1", "h2", "h3"}:
+#            htxt = _norm(el.get_text(" ", strip=True))
+#            if htxt.lower().startswith("meyrin"):
+#                tno = _parse_team_no_from_name(htxt)
+#                if tno:
+#                    current_team_no = tno
+#
+#        if el.name == "table" and current_team_no is not None:
+#            # parse rows
+#            for tr in el.find_all("tr"):
+#                tds = tr.find_all("td")
+#                if len(tds) < 2:
+#                    continue
+#                row_text = _norm(tr.get_text(" ", strip=True)).lower()
+#                if target_last_first not in row_text and target_first_last not in row_text:
+#                    continue
+#
+#                # Try find "Einsätze" number anywhere in row
+#                # Commonly the last numeric field; take max integer found
+#                ints = [int(x) for x in re.findall(r"\b(\d+)\b", tr.get_text(" ", strip=True))]
+#                if not ints:
+#                    continue
+#                count = max(ints)
+#
+#                # Determine marker: first cell might be "7.1" (regular) or "S" / "E" / "V"
+#                first_cell = _norm(tds[0].get_text(" ", strip=True))
+#                marker = first_cell.upper()
+#
+#                apps[current_team_no] = count
+#                if marker in SUB_MARKERS:
+#                    sub_apps[current_team_no] = count
+#
+#    return apps, sub_apps
+#
+def best_team_rank(team_no: int, teams_by_no: Dict[int, TeamInfo]) -> int:
+    info = teams_by_no.get(team_no)
+    return league_rank(info.league_label) if info else 0
 
 
 # -----------------------------
@@ -579,6 +664,43 @@ def check_eligibility(
 
     def higher(a: int, b: int) -> bool:
         return lr.get(a, 0) > lr.get(b, 0)
+
+# ---- Strict: lock to a higher team after 3 substitute alignments there (50.4.6) ----
+    locked_team_no: Optional[int] = None
+    
+    if nominated_team_no is not None:
+        base = nominated_team_no
+        # If player has 3+ substitute appearances in ANY higher team, they are locked to that higher team
+        higher_teams = [tno for tno in sub_apps.keys() if higher(tno, base)]
+        for tno in higher_teams:
+            if sub_apps.get(tno, 0) >= 3:
+                # if multiple, lock to the highest league among them (safest)
+                if locked_team_no is None or lr.get(tno, 0) > lr.get(locked_team_no, 0):
+                    locked_team_no = tno
+    
+    if locked_team_no is not None and target_team.team_no != locked_team_no:
+        return False, [
+            "NOT ELIGIBLE (50.4.6 strict): player became titulaire in a higher team after 3 substitute matches and is locked to that team.",
+            f"Locked team: {locked_team_no} ({teams_by_no[locked_team_no].league_label}). Target: {target_team.team_no} ({target_team.league_label})."
+        ]
+
+# ---- Strict: if player is aligned in a higher league team this season, they cannot play down ----
+    target_rank = lr.get(target_team.team_no, 0)
+    
+    # Consider nominated team as "aligned"
+    if nominated_team_no is not None and lr.get(nominated_team_no, 0) > target_rank:
+        return False, [
+            "NOT ELIGIBLE (strict no playing down): player is nominated in a higher league team for this season.",
+            f"Nominated team: {nominated_team_no} ({teams_by_no[nominated_team_no].league_label}) > Target: {target_team.team_no} ({target_team.league_label})."
+        ]
+    
+    # Consider any higher team already played this season (both phases, because apps were summed)
+    for tno in played_teams:
+        if lr.get(tno, 0) > target_rank:
+            return False, [
+                "NOT ELIGIBLE (strict no playing down): player has already played in a higher league team this season.",
+                f"Higher team played: {tno} ({teams_by_no[tno].league_label}) > Target: {target_team.team_no} ({target_team.league_label})."
+            ]
 
     # ---- 50.4.5: max two teams AND in different leagues ----
     # prospective teams if we add target team
