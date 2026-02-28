@@ -674,8 +674,9 @@ for team_no, opts in sorted(team_entries.items()):
         )
     )
 
-teams_by_no = {t.team_no: t for t in teams}
+#teams_by_no = {t.team_no: t for t in teams}
 #target = st.selectbox("Meyrin team", options=teams, format_func=lambda t: f"{t.name} — {t.league_label}")
+
 
 
 with st.sidebar:
