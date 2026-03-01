@@ -481,77 +481,60 @@ def pending_results_last_48h(teams_same_league: List[TeamInfo], exclude_team_no:
 # -----------------------------
 # Simplified eligibility logic (with Case 2 exception)
 # -----------------------------
+
 def decide_eligibility(
     target: TeamInfo,
     nominated_team_no: Optional[int],
     teams_by_no: Dict[int, TeamInfo],
     apps_by_team: Dict[int, int],
 ) -> Tuple[bool, List[str]]:
-    """
-    Returns (ok, messages).
-    """
+
     msgs: List[str] = []
     total_apps = sum(apps_by_team.values())
 
-    # Case 1: never played
+    # ---------------- Case 1 ----------------
     if total_apps == 0:
         return True, [
-            "ELIGIBLE (Case 1): player is licensed but has not played yet this season in this category.",
-            "They may play in any team for their first match.",
+            "ELIGIBLE (Case 1): player has not played yet this season.",
+            "First appearance may be in any team.",
         ]
 
-    played_teams = sorted([tno for tno, n in apps_by_team.items() if n > 0 and tno in teams_by_no])
-    if not played_teams:
-        return True, ["ELIGIBLE (fallback): no played teams detected."]
+    played_teams = [tno for tno, n in apps_by_team.items() if n > 0 and tno in teams_by_no]
 
-    # base/own team: nominated if available, else team with most appearances
-    if nominated_team_no is not None and nominated_team_no in teams_by_no:
+    if not played_teams:
+        return True, ["ELIGIBLE (fallback): no valid played teams detected."]
+
+    # Determine base team
+    if nominated_team_no and nominated_team_no in teams_by_no:
         base_team_no = nominated_team_no
     else:
-        base_team_no = max(played_teams, key=lambda tno: apps_by_team.get(tno, 0))
+        base_team_no = max(played_teams, key=lambda t: apps_by_team.get(t, 0))
 
     base_rank = teams_by_no[base_team_no].league_level_rank
     target_rank = target.league_level_rank
-    max_played_rank = max(teams_by_no[tno].league_level_rank for tno in played_teams)
+    max_played_rank = max(teams_by_no[t].league_level_rank for t in played_teams)
 
-    # how many appearances ABOVE base team
+    # Appearances in target
+    already_in_target = apps_by_team.get(target.team_no, 0)
+    next_count = already_in_target + 1
+
+    # Appearances ABOVE base team
     higher_than_base_apps = sum(
-        apps_by_team[tno]
-        for tno in played_teams
-        if teams_by_no[tno].league_level_rank > base_rank
+        apps_by_team[t]
+        for t in played_teams
+        if teams_by_no[t].league_level_rank > base_rank
     )
 
-    # Case 2: generally cannot play same league or below relative to highest played league
-    if target_rank <= max_played_rank:
-        # Exception: they may still play base team if only 1–2 appearances above base
-        if target.team_no == base_team_no and higher_than_base_apps <= 2:
-            msgs.append(
-                f"Case 2 exception: player has only {higher_than_base_apps} appearance(s) above base team {base_team_no}, "
-                "so they may still play in their base team."
-            )
-        else:
-            max_rank_team = None
-            for tno in played_teams:
-                if teams_by_no[tno].league_level_rank == max_played_rank:
-                    max_rank_team = tno
-                    break
-            return False, [
-                "NOT ELIGIBLE (Case 2): player already played in same league level or higher; cannot play another team of same league or below.",
-                f"Highest league played includes team {max_rank_team} ({teams_by_no[max_rank_team].league_label}); "
-                f"target is team {target.team_no} ({target.league_label}).",
-                f"Base team is {base_team_no} ({teams_by_no[base_team_no].league_label}).",
-            ]
-    else:
-        msgs.append("Passed Case 2: target is in a higher league than any league the player has played so far.")
-
-    # Case 3: 3rd appearance in higher team => titulaire warning
+    # -------------------------------------------------------
+    # FIRST evaluate Case 3 (playing UP scenario)
+    # -------------------------------------------------------
     if target_rank > base_rank:
-        already_in_target = apps_by_team.get(target.team_no, 0)
-        next_count = already_in_target + 1
+
+        # 3rd appearance rule
         if next_count == 3:
             msgs.append(
-                f"WARNING (Case 3): this would be the 3rd appearance in higher team {target.team_no} this season. "
-                f"Player becomes titulaire of the higher team and loses right to play base team {base_team_no}."
+                f"WARNING (Case 3): this is appearance #3 in higher team {target.team_no}. "
+                f"Player becomes titulaire in that team and loses right to play base team {base_team_no}."
             )
         elif next_count > 3:
             msgs.append(
@@ -560,11 +543,35 @@ def decide_eligibility(
             )
         else:
             msgs.append(
-                f"Case 3 info: appearance #{next_count} in higher team {target.team_no} (titulaire switch happens at #3)."
+                f"Case 3 info: appearance #{next_count} in higher team {target.team_no} "
+                "(titulaire switch happens at #3)."
             )
 
-    return True, ["ELIGIBLE"] + msgs
+        # Playing UP is allowed
+        return True, ["ELIGIBLE"] + msgs
 
+    # -------------------------------------------------------
+    # THEN apply Case 2 (same league or playing down)
+    # -------------------------------------------------------
+
+    if target_rank <= max_played_rank:
+
+        # Exception: may still play base team if only 1–2 appearances above base
+        if target.team_no == base_team_no and higher_than_base_apps <= 2:
+            msgs.append(
+                f"Case 2 exception: only {higher_than_base_apps} appearance(s) above base team. "
+                "Still allowed to play base team."
+            )
+            return True, ["ELIGIBLE"] + msgs
+
+        return False, [
+            "NOT ELIGIBLE (Case 2): player already played in same league or higher; "
+            "cannot play another team of same league or below."
+        ]
+
+    # If target is strictly higher than ANY league played so far
+    msgs.append("Passed Case 2: target is higher than any league played so far.")
+    return True, ["ELIGIBLE"] + msgs
 
 # -----------------------------
 # Streamlit UI
