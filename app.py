@@ -604,10 +604,15 @@ def fetch_player_apps_across_club_teams_matchdays(
 # -----------------------------
 @st.cache_data(ttl=3600)
 def fetch_team_roster_with_rankings(team_page_url: str) -> List[Dict[str, str]]:
+    """
+    Extract a clean roster: keep ONLY rows that look like 'Lastname, Firstname' AND have a classement token (A-E + number).
+    This removes captains/headers/addresses/etc.
+    """
     r = session.get(team_page_url, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
+    # Try to jump to an actual team portrait if linked
     candidate_urls = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -616,7 +621,25 @@ def fetch_team_roster_with_rankings(team_page_url: str) -> List[Dict[str, str]]:
     candidate_urls = candidate_urls[:1] or [team_page_url]
 
     roster: List[Dict[str, str]] = []
-    seen_names = set()
+    seen = set()
+
+    name_re = re.compile(r"\b([A-Za-zÀ-ÿ'\- ]+,\s*[A-Za-zÀ-ÿ'\- ]+)\b")
+    rank_re = re.compile(r"\b([A-E])\s*([0-9]{1,2})\b", re.I)
+
+    def looks_like_player_row(txt: str) -> Optional[Tuple[str, str]]:
+        txt = _norm(txt)
+        mname = name_re.search(txt)
+        mrank = rank_re.search(txt)
+        if not mname or not mrank:
+            return None
+        name = _norm(mname.group(1))
+        rank = f"{mrank.group(1).upper()}{mrank.group(2)}"
+        # Extra safety: ignore obvious headers
+        low = txt.lower()
+        if "capitaine" in low or "responsable" in low or "route" in low or "match" in low:
+            # still allow if it contains a clear player+rank (but these lines usually won't)
+            pass
+        return name, rank
 
     for url in candidate_urls:
         rr = session.get(url, timeout=25)
@@ -624,19 +647,26 @@ def fetch_team_roster_with_rankings(team_page_url: str) -> List[Dict[str, str]]:
         ss = BeautifulSoup(rr.text, "html.parser")
 
         for tr in ss.find_all("tr"):
-            row_txt = _norm(tr.get_text(" ", strip=True))
-            if "," not in row_txt:
+            row_txt = tr.get_text(" ", strip=True)
+            parsed = looks_like_player_row(row_txt)
+            if not parsed:
                 continue
-            m = re.search(r"([A-Za-zÀ-ÿ'\- ]+,\s*[A-Za-zÀ-ÿ'\- ]+)", row_txt)
-            if not m:
+            name, rank = parsed
+            if name in seen:
                 continue
-            name = _norm(m.group(1))
-            if name in seen_names:
-                continue
-            seen_names.add(name)
-            rank = _parse_ranking_token(row_txt) or ""
+            seen.add(name)
             roster.append({"name": name, "rank": rank})
+
+    # Optional: sort by "rank strength" (roughly A1 strongest -> E99 weakest)
+    def rank_key(rk: str) -> Tuple[int, int]:
+        # A strongest => 0, E weakest => 4
+        letter = rk[0] if rk else "Z"
+        num = int(re.findall(r"\d+", rk)[0]) if re.findall(r"\d+", rk) else 99
+        return (ord(letter) - ord("A"), num)
+
+    roster.sort(key=lambda x: rank_key(x.get("rank", "")))
     return roster
+
 
 
 # -----------------------------
