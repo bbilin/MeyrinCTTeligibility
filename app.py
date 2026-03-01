@@ -1,26 +1,14 @@
 
-# app.py — Meyrin CTT Eligibility Checker (match-day counting + cross-category player search + 50.4.4 + 48h debug)
+# app.py — Meyrin CTT Eligibility Checker (match-day counting + season-aware paginated player search + 50.4.4 + 48h debug)
 #
-# Key features:
-# ✅ Appearances counted as TEAM MATCH-DAYS (rencontres), NOT individual singles/doubles.
-# ✅ Scans BOTH phases (A+B) so substitutes in the other phase are not missed.
-# ✅ Player search works across ALL licence categories (Herren/Damen/Jeunesse/O40/…),
-#    auto-detects which category(ies) the player is listed under and displays it.
-# ✅ Category dropdown (contestType) changes the team list in the dropdown (Men vs Women teams).
-# ✅ Simplified eligibility rules:
-#    Case 1: Licensed but never played -> can play any team.
-#    Case 2: Cannot play another team of the same league or below,
-#            EXCEPT can still play base team if only 1–2 appearances above base.
-#    Case 3: Playing UP relative to base is allowed; 3rd appearance in higher team triggers warning.
-#            (Case 3 evaluated BEFORE Case 2 blocks)
-#    Case 4: If eligible, scan last 48h matches of other teams in same league level with missing score -> warning.
-# ✅ 50.4.4 shown at the very end ONLY if target != base team (i.e., replacement):
-#    List target team players + rankings, show replacement player's ranking, and guide manual check.
-# ✅ Debug for last 48h: teams scanned + matches found + has_score flag.
-#
-# Notes:
-# - click-tt HTML varies; parsing is best-effort but practical.
-# - Streamlit Cloud compatible.
+# Fixes in this version:
+# ✅ Player search uses clubLicenceMembersPage WITH seasonName and follows pagination.
+# ✅ Searches across all licence categories (Herren/Damen/Jeunesse/O40/Uxx) and auto-detects which categories matched.
+# ✅ Category dropdown changes team list (Men vs Women teams).
+# ✅ Appearances counted as TEAM MATCH-DAYS (meeting pages).
+# ✅ 50.4.4 shown at end for replacements (target != base team) with roster+ranking list.
+# ✅ Last-48h warnings + full debug (teams scanned, rows found, has_score).
+# ✅ Optional "Search debug" shows how many players scanned per category and how many pages.
 
 import re
 import datetime
@@ -43,7 +31,7 @@ MEYRIN_CLUB_ID = 33165
 ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V", 6: "VI", 7: "VII", 8: "VIII", 9: "IX", 10: "X"}
 
 session = requests.Session()
-session.headers.update({"User-Agent": "Meyrin-Eligibility-Checker/fast-3.0 (+club tool; public pages only)"})
+session.headers.update({"User-Agent": "Meyrin-Eligibility-Checker/fast-3.2 (+club tool; public pages only)"})
 
 
 # -----------------------------
@@ -62,7 +50,7 @@ class TeamInfo:
 class PlayerPick:
     display_name: str
     portrait_url: str
-    licence_categories: Tuple[str, ...]  # e.g. ("${damen}", "${herren}")
+    licence_categories: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -117,7 +105,6 @@ def now_ch() -> datetime.datetime:
 def league_rank(label: str) -> int:
     """
     Higher number == higher league level.
-    Ignore phase/group text. Recognize Nationalliga A/B/C by words (not only NLA/NLB/NLC).
     """
     s = (label or "").lower()
     s = re.sub(r"\bphase\s*[ab]\b", " ", s)
@@ -154,7 +141,7 @@ def _find_links(soup: BeautifulSoup, include: List[str]) -> List[str]:
 
 
 # -----------------------------
-# Contest types config (UI + detection)
+# Contest types config
 # -----------------------------
 CONTEST_TYPES: List[Tuple[str, str]] = [
     ("Men (Herren)", "${herren}"),
@@ -171,32 +158,16 @@ TOKEN_BY_LABEL = {label: token for (label, token) in CONTEST_TYPES}
 
 
 def team_kind_from_contest_type(contest_type_token: str) -> str:
-    """
-    Determines which team rows to include from clubTeams based on contest type.
-    Returns: "men" | "women" | "all"
-    """
     if contest_type_token == "${damen}":
         return "women"
-    if contest_type_token in ("${herren}", "${o40}", "${jugend}", "${u19}", "${u15}", "${u13}"):
-        # Meyrin "clubTeams" is usually Men/Women team list; youth may still be under mixed pages.
-        # We keep men as default for these categories (you can switch to "all" if needed).
-        return "men"
-    return "all"
+    return "men"
 
 
 # -----------------------------
-# Teams (phase-aware + contestType-aware list)
+# Teams (contestType-aware)
 # -----------------------------
 @st.cache_data(ttl=3600)
 def fetch_meyrin_team_entries(team_kind: str) -> Dict[int, List[Tuple[str, str]]]:
-    """
-    Parses clubTeams page once and filters rows by team_kind.
-    team_kind:
-      - "men": Men/Herren/Hommes
-      - "women": Women/Damen/Femmes
-      - "all": everything
-    Returns dict: team_no -> list of (league_label, league_url) entries (includes Phase A and Phase B).
-    """
     url = f"{BASE}/clubTeams?club={MEYRIN_CLUB_ID}"
     r = session.get(url, timeout=25)
     r.raise_for_status()
@@ -225,11 +196,7 @@ def fetch_meyrin_team_entries(team_kind: str) -> Dict[int, List[Tuple[str, str]]
             continue
         if team_kind == "women" and not is_women_label(team_label):
             continue
-        if team_kind == "all" and not (is_men_label(team_label) or is_women_label(team_label)):
-            # skip other non-team lines
-            continue
 
-        # Determine team number (Men/Hommes/Herren => 1; ... II => 2, etc.)
         team_no = 1
         m = re.search(r"\b([ivx]+|\d+)\b$", team_label, flags=re.I)
         if m:
@@ -245,7 +212,6 @@ def fetch_meyrin_team_entries(team_kind: str) -> Dict[int, List[Tuple[str, str]]
         league_label = _norm(a.get_text(" ", strip=True)) if a else _norm(tds[1].get_text(" ", strip=True))
         league_url = _abs_url(a["href"]) if a and a.get("href") else ""
 
-        # ignore cup-ish
         if "hauptrunde" in league_label.lower() or "cup" in league_label.lower():
             continue
 
@@ -286,60 +252,135 @@ def build_teams_for_both_phases(team_entries: Dict[int, List[Tuple[str, str]]], 
 
 
 # -----------------------------
-# Player lookup across ALL categories + auto-detect
+# Season-aware paginated player search
 # -----------------------------
-def search_player_in_meyrin_club(last: str, first: str) -> List[PlayerPick]:
+def _collect_players_from_licence_page(html: str) -> List[Tuple[str, str]]:
     """
-    Search player across ALL licence categories and return which categories the player appears under.
-    This allows finding women licensed under Damen even when checking Men teams.
+    Returns list of (display_name, portrait_url) from a single page of clubLicenceMembersPage.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    out: List[Tuple[str, str]] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "playerPortrait" not in href or "person=" not in href:
+            continue
+        name_raw = _norm(a.get_text(" ", strip=True))
+        if "," not in name_raw:
+            continue
+        out.append((name_raw, _abs_url(href)))
+    return out
+
+
+def _find_next_page_url(html: str) -> Optional[str]:
+    """
+    Best-effort: find a pagination 'next' link on click-tt pages.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    # look for common next labels
+    for a in soup.find_all("a", href=True):
+        txt = _norm(a.get_text(" ", strip=True)).lower()
+        if txt in ("next", "weiter", "suivant", ">"):
+            return _abs_url(a["href"])
+        if "next" in txt or "weiter" in txt or "suivant" in txt:
+            return _abs_url(a["href"])
+    # sometimes arrow images/buttons have no text; look for "page=" / "offset=" style in href
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if any(k in href.lower() for k in ["page=", "offset=", "start="]) and "clubLicenceMembersPage" in href:
+            # not necessarily next; still helps for multi-page by exploring 2 pages max
+            return _abs_url(href)
+    return None
+
+
+def fetch_all_licence_members_for_category(season_name: str, contest_type: str) -> Tuple[List[Tuple[str, str]], Dict[str, Any]]:
+    """
+    Downloads clubLicenceMembersPage for a given contestType and seasonName, following pagination.
+    Returns (players, debug_info).
+    """
+    url = f"{BASE}/clubLicenceMembersPage"
+    params = {
+        "club": str(MEYRIN_CLUB_ID),
+        "contestType": contest_type,
+        "seasonName": season_name,
+        "preferredLanguage": "German",
+    }
+
+    debug = {"contestType": contest_type, "pages": 0, "players": 0, "urls": []}
+    all_players: List[Tuple[str, str]] = []
+    seen_urls = set()
+
+    try:
+        r = session.get(url, params=params, timeout=25)
+        r.raise_for_status()
+    except Exception as e:
+        debug["error"] = str(e)
+        return [], debug
+
+    html = r.text
+    current_url = r.url
+    # follow up to 5 pages max (safety)
+    for _ in range(5):
+        debug["pages"] += 1
+        debug["urls"].append(current_url)
+
+        page_players = _collect_players_from_licence_page(html)
+        for name, purl in page_players:
+            if purl in seen_urls:
+                continue
+            seen_urls.add(purl)
+            all_players.append((name, purl))
+
+        nxt = _find_next_page_url(html)
+        if not nxt or nxt == current_url:
+            break
+
+        try:
+            rr = session.get(nxt, timeout=25)
+            rr.raise_for_status()
+        except Exception:
+            break
+
+        current_url = rr.url
+        html = rr.text
+
+    debug["players"] = len(all_players)
+    return all_players, debug
+
+
+def search_player_in_meyrin_club(season_name: str, last: str, first: str) -> Tuple[List[PlayerPick], Dict[str, Any]]:
+    """
+    Search player across all licence categories for the given season, with pagination.
+    Returns (picks, debug).
     """
     q_last = _fold(last)
     q_first = _fold(first)
 
-    found: Dict[str, Dict[str, Any]] = {}
+    found: Dict[str, Dict[str, Any]] = {}  # portrait_url -> {"display": name, "cats": set()}
+    dbg: Dict[str, Any] = {"seasonName": season_name, "by_category": []}
 
     for ct_label, ct_token in CONTEST_TYPES:
-        url = f"{BASE}/clubLicenceMembersPage"
-        params = {
-            "club": str(MEYRIN_CLUB_ID),
-            "contestType": ct_token,
-            "preferredLanguage": "German",
-        }
+        players, d = fetch_all_licence_members_for_category(season_name, ct_token)
+        d["categoryLabel"] = ct_label
+        dbg["by_category"].append(d)
 
-        try:
-            r = session.get(url, params=params, timeout=25)
-            r.raise_for_status()
-        except Exception:
-            continue
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "playerPortrait" not in href or "person=" not in href:
-                continue
-
-            name_raw = _norm(a.get_text(" ", strip=True))
-            if "," not in name_raw:
-                continue
-
+        for name_raw, purl in players:
             name_fold = _fold(name_raw)
             if q_last and q_last not in name_fold:
                 continue
             if q_first and q_first not in name_fold:
                 continue
 
-            purl = _abs_url(href)
             if purl not in found:
                 found[purl] = {"display": name_raw, "cats": set()}
             found[purl]["cats"].add(ct_token)
 
     picks: List[PlayerPick] = []
     for purl, info in found.items():
-        cats = tuple(sorted(info["cats"]))
-        picks.append(PlayerPick(display_name=info["display"], portrait_url=purl, licence_categories=cats))
+        picks.append(PlayerPick(info["display"], purl, tuple(sorted(info["cats"]))))
 
-    # Stable sort: exact-ish matches first
+    # rank results: more exact match first
     q = (q_last + " " + q_first).strip()
+
     def score(p: PlayerPick) -> int:
         n = _fold(p.display_name)
         if q and q in n:
@@ -349,7 +390,7 @@ def search_player_in_meyrin_club(last: str, first: str) -> List[PlayerPick]:
         return 2
 
     picks.sort(key=score)
-    return picks
+    return picks, dbg
 
 
 def infer_player_name_from_portrait(portrait_url: str) -> PlayerKey:
@@ -358,13 +399,11 @@ def infer_player_name_from_portrait(portrait_url: str) -> PlayerKey:
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text("\n", strip=True)
 
-    for line in text.split("\n")[:100]:
+    for line in text.split("\n")[:120]:
         if "," in line and 3 < len(line) < 120:
             parts = [p.strip() for p in line.split(",", 1)]
             if len(parts) == 2 and parts[0] and parts[1]:
-                # guard against weird lines
-                if len(parts[0].split()) <= 4 and len(parts[1].split()) <= 4:
-                    return PlayerKey(last=parts[0], first=parts[1])
+                return PlayerKey(last=parts[0], first=parts[1])
 
     return PlayerKey(last="", first="")
 
@@ -373,10 +412,6 @@ def infer_player_name_from_portrait(portrait_url: str) -> PlayerKey:
 # Ranking parsing (best-effort)
 # -----------------------------
 def _parse_ranking_token(s: str) -> Optional[str]:
-    """
-    Best-effort parse of ranking/class tokens like D1/C8/B12/A16 etc.
-    (We display them; we do not reliably compare ordering without federation rules.)
-    """
     s = _norm(s).upper()
     m = re.search(r"\b([A-E])\s*([0-9]{1,2})\b", s)
     if m:
@@ -455,10 +490,6 @@ def fetch_regular_registration_nominated_team(season_name: str, contest_type_tok
 # -----------------------------
 @st.cache_data(ttl=3600)
 def find_team_page_from_league(league_url: str, team_no: int, club_prefix: str) -> Optional[str]:
-    """
-    From league/group page, find link to the specific club team page.
-    We look for "Meyrin VI" etc. (club_prefix supports Women teams too if named similarly).
-    """
     if not league_url:
         return None
     r = session.get(league_url, timeout=25)
@@ -476,9 +507,6 @@ def find_team_page_from_league(league_url: str, team_no: int, club_prefix: str) 
 
 
 def find_team_match_list_url(team_page_url: str) -> str:
-    """
-    Prefer a dedicated match list page if linked.
-    """
     r = session.get(team_page_url, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -488,14 +516,10 @@ def find_team_match_list_url(team_page_url: str) -> str:
 
 
 # -----------------------------
-# Match-day counting (correct appearances)
+# Match-day counting
 # -----------------------------
 @st.cache_data(ttl=900)
 def count_player_matchdays_for_team(team_page_url: str, player: PlayerKey, max_meetings: int = 40) -> int:
-    """
-    Counts appearances as TEAM MATCH-DAYS by scanning meeting pages.
-    """
-    # click-tt meeting pages usually contain "Last, First" in HTML
     target1 = f"{player.last}, {player.first}".lower()
     target2 = f"{player.first} {player.last}".lower()
 
@@ -517,7 +541,6 @@ def count_player_matchdays_for_team(team_page_url: str, player: PlayerKey, max_m
         txt = mr.text.lower()
         if target1 in txt or target2 in txt:
             count += 1
-
     return count
 
 
@@ -528,10 +551,6 @@ def fetch_player_apps_across_club_teams_matchdays(
     club_prefix: str,
     max_meetings_per_team: int = 40,
 ) -> Dict[int, int]:
-    """
-    Counts match-day appearances per team, summed across phase pages.
-    Returns team_no -> count (>0 only).
-    """
     out: Dict[int, int] = {}
     for t in teams:
         team_page = find_team_page_from_league(t.league_url, t.team_no, club_prefix=club_prefix)
@@ -544,14 +563,10 @@ def fetch_player_apps_across_club_teams_matchdays(
 
 
 # -----------------------------
-# 50.4.4 roster listing (best-effort)
+# 50.4.4 roster listing
 # -----------------------------
 @st.cache_data(ttl=3600)
 def fetch_team_roster_with_rankings(team_page_url: str) -> List[Dict[str, str]]:
-    """
-    Best-effort: parse a team page (or linked teamPortrait) and extract player names + ranking tokens.
-    Returns list of dicts: {"name": "Last, First", "rank": "D1"} (rank may be empty).
-    """
     r = session.get(team_page_url, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -575,7 +590,6 @@ def fetch_team_roster_with_rankings(team_page_url: str) -> List[Dict[str, str]]:
             row_txt = _norm(tr.get_text(" ", strip=True))
             if "," not in row_txt:
                 continue
-
             m = re.search(r"([A-Za-zÀ-ÿ'\- ]+,\s*[A-Za-zÀ-ÿ'\- ]+)", row_txt)
             if not m:
                 continue
@@ -583,15 +597,13 @@ def fetch_team_roster_with_rankings(team_page_url: str) -> List[Dict[str, str]]:
             if name in seen_names:
                 continue
             seen_names.add(name)
-
             rank = _parse_ranking_token(row_txt) or ""
             roster.append({"name": name, "rank": rank})
-
     return roster
 
 
 # -----------------------------
-# Recent pending results (last 48h) + debug
+# Last 48h scan + debug
 # -----------------------------
 def parse_date_from_text(s: str) -> Optional[datetime.datetime]:
     s = _norm(s)
@@ -671,14 +683,9 @@ def decide_eligibility(
     teams_by_no: Dict[int, TeamInfo],
     apps_by_team: Dict[int, int],
 ) -> Tuple[bool, List[str], int]:
-    """
-    Returns (ok, messages, base_team_no).
-    base_team_no used for replacement detection and 50.4.4 display.
-    """
     msgs: List[str] = []
     total_apps = sum(apps_by_team.values())
 
-    # Case 1: never played
     if total_apps == 0:
         return True, [
             "ELIGIBLE (Case 1): player has not played yet this season.",
@@ -689,7 +696,6 @@ def decide_eligibility(
     if not played_teams:
         return True, ["ELIGIBLE (fallback): no valid played teams detected."], -1
 
-    # base team = nominated if possible, else team with most appearances
     if nominated_team_no is not None and nominated_team_no in teams_by_no:
         base_team_no = nominated_team_no
     else:
@@ -708,7 +714,7 @@ def decide_eligibility(
         if teams_by_no[t].league_level_rank > base_rank
     )
 
-    # Case 3 first: playing UP relative to base is allowed, with 3rd appearance warning
+    # Case 3 first: playing UP
     if target_rank > base_rank:
         if next_count == 3:
             msgs.append(
@@ -726,9 +732,8 @@ def decide_eligibility(
             )
         return True, ["ELIGIBLE"] + msgs, base_team_no
 
-    # Case 2 (same league or down)
+    # Case 2: same league or down
     if target_rank <= max_played_rank:
-        # Exception: allow base team if only 1–2 appearances above base
         if target.team_no == base_team_no and higher_than_base_apps <= 2:
             msgs.append(
                 f"Case 2 exception: only {higher_than_base_apps} appearance(s) above base team {base_team_no}; "
@@ -746,7 +751,7 @@ def decide_eligibility(
 
 
 # -----------------------------
-# Streamlit UI
+# UI
 # -----------------------------
 st.set_page_config(page_title="Meyrin CTT – Eligibility Checker", layout="wide")
 st.title("Meyrin CTT – Eligibility Checker")
@@ -764,10 +769,7 @@ with st.sidebar:
 team_kind = team_kind_from_contest_type(contest_type)
 team_entries = fetch_meyrin_team_entries(team_kind=team_kind)
 
-# Club prefix used for resolving team pages on league/group pages
-# (Usually "Meyrin" for both men and women; adjust if your women teams use different club string)
 club_prefix = "Meyrin"
-
 teams_ui = build_teams_for_phase(team_entries, ui_phase, prefix=club_prefix)
 teams_by_no = {t.team_no: t for t in teams_ui}
 
@@ -789,6 +791,8 @@ with c2:
 
 run_pending_check = st.checkbox("Check last 48h unpublished results (warnings)", value=True)
 show_last48_debug = st.checkbox("Show last 48h debug (teams + matches found)", value=False)
+show_search_debug = st.checkbox("Show player search debug (pages scanned per category)", value=False)
+
 max_meetings = st.slider("Max match-days to scan per team+phase", min_value=10, max_value=60, value=35, step=5)
 show_5044 = st.checkbox("Show 50.4.4 ranking/roster info at end (replacement only)", value=True)
 
@@ -797,9 +801,14 @@ if st.button("Check eligibility"):
         st.error("Please enter both last name and first name.")
         st.stop()
 
-    picks = search_player_in_meyrin_club(last.strip(), first.strip())
+    picks, search_dbg = search_player_in_meyrin_club(season_name=season_name, last=last.strip(), first=first.strip())
+
+    if show_search_debug:
+        st.markdown("### Debug — player search")
+        st.json(search_dbg)
+
     if not picks:
-        st.error("Player not found in Meyrin licence lists (searched across Herren/Damen/Jeunesse/O40/Uxx).")
+        st.error("Player not found in Meyrin licence lists (season-aware, paginated, searched across Herren/Damen/Jeunesse/O40/Uxx).")
         st.stop()
 
     pick = picks[0]
@@ -814,16 +823,15 @@ if st.button("Check eligibility"):
     if not player_key.last or not player_key.first:
         player_key = PlayerKey(last=last.strip(), first=first.strip())
 
-    # Auto-detected licence categories
     licence_labels = [CT_LABEL_BY_TOKEN.get(x, x) for x in pick.licence_categories]
 
-    # Note: Women can play in men series (you referenced this; typically 50.4.2)
+    # 50.4.2 informational note
     if contest_type == "${herren}" and "${damen}" in pick.licence_categories and "${herren}" not in pick.licence_categories:
         st.info("Detected **Damen** licence. In men category, **dames can also play** (commonly ref. 50.4.2).")
 
     nominated_team_no = fetch_regular_registration_nominated_team(season_name, contest_type, player_key)
 
-    # Appearances counted as match-days across BOTH phases (A+B)
+    # match-day appearances across BOTH phases
     teams_both = build_teams_for_both_phases(team_entries, prefix=club_prefix)
     apps_by_team = fetch_player_apps_across_club_teams_matchdays(
         player_key,
@@ -833,18 +841,14 @@ if st.button("Check eligibility"):
     )
 
     ok, messages, base_team_no = decide_eligibility(target, nominated_team_no, teams_by_no, apps_by_team)
+    player_rank = fetch_player_ranking_from_portrait(pick.portrait_url) or ""
 
     st.markdown("### Result")
-    if ok:
-        st.success(messages[0])
-    else:
-        st.error(messages[0])
+    st.success(messages[0]) if ok else st.error(messages[0])
 
     st.markdown("### Reasoning / Warnings")
     for m in messages[1:]:
         st.write(f"- {m}")
-
-    player_rank = fetch_player_ranking_from_portrait(pick.portrait_url) or ""
 
     st.markdown("### Details")
     st.write(
@@ -865,8 +869,13 @@ if st.button("Check eligibility"):
     last48_debug_data = None
     if ok and run_pending_check:
         same_level_teams = [t for t in teams_ui if t.league_level_rank == target.league_level_rank]
-        warnings, dbg = pending_results_last_48h_with_debug(same_level_teams, exclude_team_no=target.team_no, club_prefix=club_prefix)
+        warnings, dbg = pending_results_last_48h_with_debug(
+            same_level_teams,
+            exclude_team_no=target.team_no,
+            club_prefix=club_prefix,
+        )
         last48_debug_data = dbg
+
         if warnings:
             st.warning(
                 "Recent matches (last 48h) in other teams of the same league may have unpublished results. "
@@ -877,12 +886,9 @@ if st.button("Check eligibility"):
 
     if ok and run_pending_check and show_last48_debug:
         st.markdown("### Debug — last 48 hours scan")
-        if not last48_debug_data:
-            st.info("No debug data collected (either no teams scanned or no matches within 48h).")
-        else:
-            st.json(last48_debug_data)
+        st.json(last48_debug_data or {})
 
-    # 50.4.4 at the very end (only if replacement: target team != base team)
+    # 50.4.4 at the end (replacement only)
     if show_5044 and ok:
         is_replacement = (base_team_no != -1 and target.team_no != base_team_no)
         if is_replacement:
@@ -891,19 +897,11 @@ if st.button("Check eligibility"):
             st.write(f"- Replacement player: **{player_key.last}, {player_key.first}** — ranking: **{player_rank or 'unknown'}**")
 
             team_page = find_team_page_from_league(target.league_url, target.team_no, club_prefix=club_prefix)
-            if team_page:
-                roster = fetch_team_roster_with_rankings(team_page)
-            else:
-                roster = []
+            roster = fetch_team_roster_with_rankings(team_page) if team_page else []
 
             if roster:
                 st.write(f"Target team roster (best-effort from click-tt): **{target.name}**")
                 st.dataframe(roster, use_container_width=True)
-                st.info(
-                    "⚠️ Please ensure the **specific titulaire being replaced** has a ranking **at least as strong** as the replacement player."
-                )
+                st.info("⚠️ Verify the **specific titulaire being replaced** has ranking ≥ replacement player's ranking.")
             else:
-                st.warning(
-                    "Could not extract the target team roster/rankings from click-tt automatically. "
-                    "Please open the team page and verify the titulaire being replaced."
-                )
+                st.warning("Could not extract target team roster/rankings automatically; open the team page and verify manually.")
