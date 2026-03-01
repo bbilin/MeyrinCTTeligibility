@@ -1,4 +1,8 @@
-# app.py — FAST simplified eligibility checker for Meyrin CTT (with both-phase scan + match-sheet fallback)
+
+# app.py — Meyrin CTT Eligibility Checker (Fast + correct match-day counting)
+#
+# Counts "appearances" as TEAM MATCH-DAYS (rencontres), NOT individual singles/doubles.
+# One team match-day may include 3 singles + 1 double → counts as 1 appearance.
 #
 # Simplified rules:
 # Case 1: Licensed but never played this season (category) -> can play any team.
@@ -6,15 +10,15 @@
 #         EXCEPT: they may still play in their own/base lower team if they only played 1–2 times above it.
 # Case 3: If playing up (target higher than base), 3rd appearance in that higher team -> WARNING:
 #         becomes titulaire there and loses right to play base team (still allowed today, but warned).
+#         IMPORTANT: Case 3 must be evaluated BEFORE Case 2 blocks.
 # Case 4: If eligible, check last 48h matches of OTHER teams in same league level where results may be unpublished -> WARNING.
 #
-# Data strategy (fast + accurate enough):
-# - Player lookup via clubLicenceMembersPage (reliable)
-# - Nominated/base team via clubPools/groupPools (best-effort)
-# - Appearances by team via team roster/bilan table pages across BOTH phases (A+B), summed
-# - Fallback: if target team is missing, scan last N match sheets for target team only (fast)
-#
-# Deploy: Streamlit Cloud compatible.
+# Data strategy (fast enough, more correct):
+# - Player lookup via clubLicenceMembersPage
+# - Nominated team via clubPools/groupPools (best-effort)
+# - Appearances by team: for each Meyrin team (both phases), open team match list, then meeting pages:
+#     if player name appears in a meeting page -> +1 for that team (match-day)
+# - Cached to reduce repeated requests.
 
 import re
 import datetime
@@ -33,10 +37,11 @@ except Exception:
 
 BASE = "https://www.click-tt.ch/cgi-bin/WebObjects/nuLigaTTCH.woa/wa"
 MEYRIN_CLUB_ID = 33165
+
 ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V", 6: "VI", 7: "VII", 8: "VIII", 9: "IX", 10: "X"}
 
 session = requests.Session()
-session.headers.update({"User-Agent": "Meyrin-Eligibility-Checker/fast-1.1 (+club tool; public pages only)"})
+session.headers.update({"User-Agent": "Meyrin-Eligibility-Checker/fast-2.0 (+club tool; public pages only)"})
 
 
 # -----------------------------
@@ -92,26 +97,28 @@ def infer_default_phase() -> str:
 def league_rank(label: str) -> int:
     """
     Higher number == higher league level.
-    Ignore phase/group text.
+    Ignore phase/group text. Recognize Nationalliga A/B/C by words (not only NLA/NLB/NLC).
     """
     s = (label or "").lower()
     s = re.sub(r"\bphase\s*[ab]\b", " ", s)
     s = re.sub(r"\bgr\.?\s*\d+\b", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
 
-    if "nla" in s:
+    # National leagues
+    if "nationalliga a" in s or "nla" in s:
         return 100
-    if "nlb" in s:
+    if "nationalliga b" in s or "nlb" in s:
         return 90
-    if "nlc" in s:
+    if "nationalliga c" in s or "nlc" in s:
         return 80
 
-    m = re.search(r"\b(?:ligue|liga)\s*(\d+)\b", s)
+    # Regional leagues
+    m = re.search(r"\b(\d+)\s*(?:ème|eme|\.|)\s*(?:ligue|liga)\b", s)
     if m:
         n = int(m.group(1))
         return 70 - n
 
-    m = re.search(r"\b(\d+)\s*(?:ème|eme|\.|)\s*(?:ligue|liga)\b", s)
+    m = re.search(r"\b(?:ligue|liga)\s*(\d+)\b", s)
     if m:
         n = int(m.group(1))
         return 70 - n
@@ -242,6 +249,7 @@ def search_player_in_meyrin_club(last: str, first: str) -> List[PlayerPick]:
         if "playerPortrait" in href and "person=" in href:
             picks.append(PlayerPick(display_name=name, portrait_url=_abs_url(href)))
 
+    # de-dup
     seen = set()
     out = []
     for p in picks:
@@ -318,10 +326,13 @@ def fetch_regular_registration_nominated_team(season_name: str, contest_type_tok
 
 
 # -----------------------------
-# FAST appearances scan (team roster/bilan), across BOTH phases
+# Resolve team page + match list
 # -----------------------------
 @st.cache_data(ttl=3600)
 def find_team_page_from_league(league_url: str, team_no: int) -> Optional[str]:
+    """
+    From league/group page, find link to the specific Meyrin team page.
+    """
     if not league_url:
         return None
     r = session.get(league_url, timeout=25)
@@ -338,58 +349,10 @@ def find_team_page_from_league(league_url: str, team_no: int) -> Optional[str]:
     return None
 
 
-def _pick_best_roster_like_url(team_page_url: str) -> str:
-    r = session.get(team_page_url, timeout=25)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "teamPortrait" in href or "teamPortraitTT" in href:
-            return _abs_url(href)
-    return team_page_url
-
-
-def extract_player_apps_from_team_page(team_roster_url: str, player: PlayerKey) -> int:
-    r = session.get(team_roster_url, timeout=25)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    target1 = f"{player.last}, {player.first}".lower()
-    target2 = f"{player.first} {player.last}".lower()
-
-    for tr in soup.find_all("tr"):
-        row_text = _norm(tr.get_text(" ", strip=True)).lower()
-        if target1 not in row_text and target2 not in row_text:
-            continue
-        ints = [int(x) for x in re.findall(r"\b(\d+)\b", tr.get_text(" ", strip=True))]
-        if ints:
-            return ints[-1]
-        return 0
-
-    return 0
-
-
-@st.cache_data(ttl=900)
-def fetch_player_apps_across_meyrin_teams(player: PlayerKey, teams: List[TeamInfo]) -> Dict[int, int]:
-    """
-    Sums appearances across phase pages (teams list may contain same team_no with different league_url).
-    """
-    out: Dict[int, int] = {}
-    for t in teams:
-        team_page = find_team_page_from_league(t.league_url, t.team_no)
-        if not team_page:
-            continue
-        roster_url = _pick_best_roster_like_url(team_page)
-        apps = extract_player_apps_from_team_page(roster_url, player)
-        if apps > 0:
-            out[t.team_no] = out.get(t.team_no, 0) + apps
-    return out
-
-
-# -----------------------------
-# Match-sheet fallback for missing target team
-# -----------------------------
 def find_team_match_list_url(team_page_url: str) -> str:
+    """
+    Prefer a dedicated match list page (teamMeetings/teamMatches) if linked; else team_page_url.
+    """
     r = session.get(team_page_url, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -398,7 +361,14 @@ def find_team_match_list_url(team_page_url: str) -> str:
     return team_page_url
 
 
-def count_player_in_last_matches(team_page_url: str, player: PlayerKey, max_matches: int = 12) -> int:
+# -----------------------------
+# Match-day counting (correct appearances)
+# -----------------------------
+@st.cache_data(ttl=900)
+def count_player_matchdays_for_team(team_page_url: str, player: PlayerKey, max_meetings: int = 40) -> int:
+    """
+    Counts appearances as TEAM MATCH-DAYS by scanning meeting pages.
+    """
     target1 = f"{player.last}, {player.first}".lower()
     target2 = f"{player.first} {player.last}".lower()
 
@@ -407,24 +377,47 @@ def count_player_in_last_matches(team_page_url: str, player: PlayerKey, max_matc
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    match_links = _find_links(soup, include=["groupMeeting", "teamMeeting", "meeting", "match"])
-    match_links = match_links[:max_matches]
+    # meeting sheet links
+    meeting_links = _find_links(soup, include=["groupMeeting", "teamMeeting", "meeting"])
+    meeting_links = meeting_links[:max_meetings]
 
     count = 0
-    for murl in match_links:
+    for url in meeting_links:
         try:
-            mr = session.get(murl, timeout=25)
+            mr = session.get(url, timeout=25)
             mr.raise_for_status()
         except Exception:
             continue
         txt = mr.text.lower()
         if target1 in txt or target2 in txt:
             count += 1
+
     return count
 
 
+@st.cache_data(ttl=900)
+def fetch_player_apps_across_meyrin_teams_matchdays(
+    player: PlayerKey,
+    teams: List[TeamInfo],
+    max_meetings_per_team: int = 40,
+) -> Dict[int, int]:
+    """
+    Counts match-day appearances per team, summed across phase pages (teams list may have same team_no twice).
+    Returns team_no -> matchdays_count (>0 only).
+    """
+    out: Dict[int, int] = {}
+    for t in teams:
+        team_page = find_team_page_from_league(t.league_url, t.team_no)
+        if not team_page:
+            continue
+        n = count_player_matchdays_for_team(team_page, player, max_meetings=max_meetings_per_team)
+        if n > 0:
+            out[t.team_no] = out.get(t.team_no, 0) + n
+    return out
+
+
 # -----------------------------
-# Recent pending results (last 48h) check
+# Recent pending results (last 48h)
 # -----------------------------
 def parse_date_from_text(s: str) -> Optional[datetime.datetime]:
     s = _norm(s)
@@ -461,6 +454,7 @@ def pending_results_last_48h(teams_same_league: List[TeamInfo], exclude_team_no:
         rr.raise_for_status()
         soup = BeautifulSoup(rr.text, "html.parser")
 
+        # Scan rows for dates and missing scores
         for tr in soup.find_all("tr"):
             txt = _norm(tr.get_text(" ", strip=True))
             dt = parse_date_from_text(txt)
@@ -469,30 +463,28 @@ def pending_results_last_48h(teams_same_league: List[TeamInfo], exclude_team_no:
             if dt < cutoff or dt > now + datetime.timedelta(hours=2):
                 continue
 
+            # Suspicious: "-:-" or no score token "8:2"
             if "-:-" in txt or ":-" in txt:
                 warnings.append(f"Team {t.name}: match within last 48h might have unpublished result: {txt}")
-            else:
-                if not re.search(r"\b\d+\s*:\s*\d+\b", txt):
-                    warnings.append(f"Team {t.name}: recent match may not have published score yet: {txt}")
+            elif not re.search(r"\b\d+\s*:\s*\d+\b", txt):
+                warnings.append(f"Team {t.name}: recent match may not have published score yet: {txt}")
 
     return list(dict.fromkeys(warnings))[:10]
 
 
 # -----------------------------
-# Simplified eligibility logic (with Case 2 exception)
+# Eligibility logic (Case 3 checked before Case 2 blocks)
 # -----------------------------
-
 def decide_eligibility(
     target: TeamInfo,
     nominated_team_no: Optional[int],
     teams_by_no: Dict[int, TeamInfo],
     apps_by_team: Dict[int, int],
 ) -> Tuple[bool, List[str]]:
-
     msgs: List[str] = []
     total_apps = sum(apps_by_team.values())
 
-    # ---------------- Case 1 ----------------
+    # Case 1: never played
     if total_apps == 0:
         return True, [
             "ELIGIBLE (Case 1): player has not played yet this season.",
@@ -500,12 +492,11 @@ def decide_eligibility(
         ]
 
     played_teams = [tno for tno, n in apps_by_team.items() if n > 0 and tno in teams_by_no]
-
     if not played_teams:
         return True, ["ELIGIBLE (fallback): no valid played teams detected."]
 
-    # Determine base team
-    if nominated_team_no and nominated_team_no in teams_by_no:
+    # base team = nominated if possible, else team with most appearances
+    if nominated_team_no is not None and nominated_team_no in teams_by_no:
         base_team_no = nominated_team_no
     else:
         base_team_no = max(played_teams, key=lambda t: apps_by_team.get(t, 0))
@@ -514,70 +505,58 @@ def decide_eligibility(
     target_rank = target.league_level_rank
     max_played_rank = max(teams_by_no[t].league_level_rank for t in played_teams)
 
-    # Appearances in target
     already_in_target = apps_by_team.get(target.team_no, 0)
     next_count = already_in_target + 1
 
-    # Appearances ABOVE base team
     higher_than_base_apps = sum(
         apps_by_team[t]
         for t in played_teams
         if teams_by_no[t].league_level_rank > base_rank
     )
 
-    # -------------------------------------------------------
-    # FIRST evaluate Case 3 (playing UP scenario)
-    # -------------------------------------------------------
+    # --- Case 3 first: playing UP relative to base is allowed, with 3rd appearance warning ---
     if target_rank > base_rank:
-
-        # 3rd appearance rule
         if next_count == 3:
             msgs.append(
-                f"WARNING (Case 3): this is appearance #3 in higher team {target.team_no}. "
-                f"Player becomes titulaire in that team and loses right to play base team {base_team_no}."
+                f"WARNING (Case 3): this would be appearance #3 in higher team {target.team_no}. "
+                f"Player becomes titulaire there and loses right to play base team {base_team_no}."
             )
         elif next_count > 3:
             msgs.append(
                 f"WARNING (Case 3): player already has {already_in_target} appearances in higher team {target.team_no}. "
-                f"They should no longer play in base team {base_team_no}."
+                f"They should no longer play base team {base_team_no}."
             )
         else:
             msgs.append(
-                f"Case 3 info: appearance #{next_count} in higher team {target.team_no} "
-                "(titulaire switch happens at #3)."
+                f"Case 3 info: appearance #{next_count} in higher team {target.team_no} (titulaire switch at #3)."
             )
 
-        # Playing UP is allowed
         return True, ["ELIGIBLE"] + msgs
 
-    # -------------------------------------------------------
-    # THEN apply Case 2 (same league or playing down)
-    # -------------------------------------------------------
-
+    # --- Case 2 (same league or down) ---
     if target_rank <= max_played_rank:
-
-        # Exception: may still play base team if only 1–2 appearances above base
+        # Exception: allow base team if only 1–2 appearances above base
         if target.team_no == base_team_no and higher_than_base_apps <= 2:
             msgs.append(
-                f"Case 2 exception: only {higher_than_base_apps} appearance(s) above base team. "
-                "Still allowed to play base team."
+                f"Case 2 exception: only {higher_than_base_apps} appearance(s) above base team {base_team_no}; "
+                "still allowed to play base team."
             )
             return True, ["ELIGIBLE"] + msgs
 
         return False, [
-            "NOT ELIGIBLE (Case 2): player already played in same league or higher; "
-            "cannot play another team of same league or below."
+            "NOT ELIGIBLE (Case 2): player already played in same league level or higher; "
+            "cannot play another team of same league or below.",
         ]
 
-    # If target is strictly higher than ANY league played so far
     msgs.append("Passed Case 2: target is higher than any league played so far.")
     return True, ["ELIGIBLE"] + msgs
+
 
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="Meyrin CTT – Eligibility Checker (Fast)", layout="wide")
-st.title("Meyrin CTT – Eligibility Checker (Fast simplified)")
+st.set_page_config(page_title="Meyrin CTT – Eligibility Checker", layout="wide")
+st.title("Meyrin CTT – Eligibility Checker (match-day counting)")
 
 team_entries = fetch_meyrin_team_entries()
 
@@ -610,7 +589,6 @@ with st.sidebar:
     if not teams_ui:
         st.error("No teams found from click-tt clubTeams page.")
         st.stop()
-
     target = st.selectbox("Meyrin team", options=teams_ui, format_func=lambda t: f"{t.name} — {t.league_label}")
 
 st.divider()
@@ -623,8 +601,7 @@ with c2:
     first = st.text_input("First name", value="")
 
 run_pending_check = st.checkbox("Also check last 48h pending results (warnings)", value=True)
-fallback_match_scan = st.checkbox("Fallback: scan last matches if target team not found", value=True)
-fallback_max_matches = st.slider("Fallback max matches to scan (target team only)", 5, 25, 12, 1)
+max_meetings = st.slider("Max match-days to scan per team+phase", min_value=10, max_value=60, value=40, step=5)
 
 if st.button("Check eligibility"):
     if not last.strip() or not first.strip():
@@ -646,21 +623,9 @@ if st.button("Check eligibility"):
 
     nominated_team_no = fetch_regular_registration_nominated_team(season_name, contest_type, player_key)
 
-    # Scan BOTH phases to not miss substitutes in other phase
+    # Count match-day appearances across BOTH phases so you don't miss Phase A vs Phase B substitutes
     teams_both = build_teams_for_both_phases(team_entries)
-    apps_by_team = fetch_player_apps_across_meyrin_teams(player_key, teams_both)
-
-    # Fallback: if target team missing, scan last match sheets for target team
-    fallback_used = False
-    fallback_found = 0
-    if fallback_match_scan and target.team_no not in apps_by_team:
-        team_page = find_team_page_from_league(target.league_url, target.team_no)
-        if team_page:
-            found = count_player_in_last_matches(team_page, player_key, max_matches=fallback_max_matches)
-            if found > 0:
-                apps_by_team[target.team_no] = found
-                fallback_used = True
-                fallback_found = found
+    apps_by_team = fetch_player_apps_across_meyrin_teams_matchdays(player_key, teams_both, max_meetings_per_team=max_meetings)
 
     ok, messages = decide_eligibility(target, nominated_team_no, teams_by_no, apps_by_team)
 
@@ -673,8 +638,6 @@ if st.button("Check eligibility"):
     st.markdown("### Reasoning / Warnings")
     for m in messages[1:]:
         st.write(f"- {m}")
-    if fallback_used:
-        st.info(f"Fallback used: found {fallback_found} appearance(s) for target team {target.team_no} by scanning last match sheets.")
 
     st.markdown("### Details")
     st.write(
@@ -682,7 +645,7 @@ if st.button("Check eligibility"):
             "player": f"{player_key.last}, {player_key.first}",
             "portrait": pick.portrait_url,
             "nominated_team_no": nominated_team_no,
-            "apps_by_team": apps_by_team,
+            "apps_by_team_matchdays": apps_by_team,
             "target_team": f"{target.name} ({target.league_label})",
         }
     )
