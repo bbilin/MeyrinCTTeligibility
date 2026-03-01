@@ -1,23 +1,22 @@
 
-# app.py — Meyrin CTT Eligibility Checker (full, auto team groups, no manual override)
+# app.py — Meyrin CTT Eligibility Checker (FULL INTEGRATED)
 #
-# Includes:
-# - Player search via clubLicenceMembersPage with gender=MALE/FEMALE (click-tt requirement)
-# - Auto-detect player licence source (GENDER:MALE/FEMALE) and show 50.4.2 info when checking Men
-# - Teams dropdown: automatic determination from clubTeams prefixes (Hommes/O40/Jeunesse/...)
-#   (NO optional override, per request)
-# - Category membership gate for O40/Jeunesse/Uxx using clubPools/groupPools:
-#   if player not listed in that competition -> NOT ELIGIBLE
-# - Appearances counted as TEAM MATCH-DAYS (meeting sheets), not individual games
-# - Simplified rules:
-#   Case 1: never played -> can play any team
-#   Case 2: cannot play another team of same league or below,
-#           EXCEPT can still play base team if only 1–2 appearances above base
-#   Case 3: playing UP relative to base is allowed; 3rd appearance in higher team => warning (titulaire)
-#           Case 3 evaluated BEFORE Case 2
-#   Case 4: if eligible, check last 48h other teams in same league for unpublished results -> warning
-# - 50.4.4 displayed at end ONLY if replacement (target != base team):
-#   list target team roster (best-effort) + rankings and replacement player's ranking
+# Integrated changes:
+# ✅ Teams dropdown: automatic determination from clubTeams prefixes (Hommes/O40/Jeunesse/...)
+# ✅ Player search: clubLicenceMembersPage with gender=MALE/FEMALE (click-tt requirement)
+# ✅ Category eligibility from PLAYER PORTRAIT Ageclass + Permission to Play (authoritative)
+# ✅ Appearances counted as TEAM MATCH-DAYS (meeting sheets), not individual games
+# ✅ Simplified eligibility rules (Case 3 evaluated before Case 2):
+#    Case 1: never played -> eligible any team
+#    Case 2: cannot play another team of same league or below,
+#            EXCEPT can still play base team if only 1–2 appearances above base
+#    Case 3: playing UP is allowed; 3rd appearance in higher team -> warning (titulaire switch)
+#    Case 4: if eligible, scan last 48h same-league other teams for unpublished scores -> warning
+# ✅ 50.4.4 at END (replacement only) now ALSO shown for first appearance when replacement cannot be ruled out
+#    Replacement detection:
+#      - nominated_team_no known: target != nominated => replacement
+#      - else base_team_no from history: target != base => replacement
+#      - else unknown: treat as replacement and warn manual verification
 #
 # Streamlit Cloud compatible.
 
@@ -42,7 +41,7 @@ MEYRIN_CLUB_ID = 33165
 ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V", 6: "VI", 7: "VII", 8: "VIII", 9: "IX", 10: "X"}
 
 session = requests.Session()
-session.headers.update({"User-Agent": "Meyrin-Eligibility-Checker/4.2 (+public pages only)"})
+session.headers.update({"User-Agent": "Meyrin-Eligibility-Checker/4.3 (+public pages only)"})
 
 
 # -----------------------------
@@ -412,24 +411,14 @@ def infer_player_name_from_portrait(portrait_url: str) -> PlayerKey:
     return PlayerKey(last="", first="")
 
 
-
-
+# -----------------------------
+# Portrait meta (Ageclass + Permission to Play)
+# -----------------------------
 @st.cache_data(ttl=3600)
 def fetch_player_meta_from_portrait(portrait_url: str) -> Dict[str, Any]:
-    """
-    Extracts Ageclass + Permission to Play date range from player portrait page (best-effort).
-    Returns:
-      {
-        "ageclass": "O50" / "O40" / "U19" / ... / None,
-        "permission_from": date or None,
-        "permission_to": date or None,
-      }
-    """
     r = session.get(portrait_url, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-
-    # We'll parse by locating labels like "Ageclass" and "Permission to Play"
     text = soup.get_text("\n", strip=True)
     lines = [_norm(x) for x in text.split("\n") if _norm(x)]
 
@@ -445,17 +434,17 @@ def fetch_player_meta_from_portrait(portrait_url: str) -> Dict[str, Any]:
     for i, ln in enumerate(lines):
         if ln.lower() == "ageclass" and i + 1 < len(lines):
             meta["ageclass"] = lines[i + 1].strip() or None
+
         if ln.lower() == "permission to play" and i + 1 < len(lines):
-            # example: "01.07.2025 - 30.06.2026"
             nxt = lines[i + 1]
-            d1 = parse_date(nxt)
-            # try second date
-            m2 = re.findall(r"\b\d{2}\.\d{2}\.\d{4}\b", nxt)
-            d2 = parse_date(m2[1]) if len(m2) >= 2 else None
-            meta["permission_from"] = d1
-            meta["permission_to"] = d2
+            dates = re.findall(r"\b\d{2}\.\d{2}\.\d{4}\b", nxt)
+            if len(dates) >= 1:
+                meta["permission_from"] = parse_date(dates[0])
+            if len(dates) >= 2:
+                meta["permission_to"] = parse_date(dates[1])
 
     return meta
+
 
 # -----------------------------
 # Ranking (best-effort)
@@ -475,69 +464,6 @@ def fetch_player_ranking_from_portrait(portrait_url: str) -> Optional[str]:
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text(" ", strip=True)
     return _parse_ranking_token(text)
-
-
-# -----------------------------
-# Category membership gate (for O40/Jeunesse/Uxx)
-# -----------------------------
-@st.cache_data(ttl=3600)
-def player_is_in_contest_category(season_name: str, contest_type_token: str, player: PlayerKey) -> Tuple[bool, Dict[str, Any]]:
-    target_last = player.last.strip().lower()
-    target_first = player.first.strip().lower()
-
-    debug: Dict[str, Any] = {"contestType": contest_type_token, "seasonName": season_name, "checked": []}
-
-    def page_has_player(html: str) -> bool:
-        soup = BeautifulSoup(html, "html.parser")
-        for tr in soup.find_all("tr"):
-            row = _norm(tr.get_text(" ", strip=True)).lower()
-            if target_last in row and target_first in row:
-                return True
-        return False
-
-    base_url = f"{BASE}/clubPools"
-    for display_typ in ("vorrunde", "rueckrunde"):
-        params = {
-            "club": str(MEYRIN_CLUB_ID),
-            "contestType": contest_type_token,
-            "displayTyp": display_typ,
-            "preferredLanguage": "German",
-            "seasonName": season_name,
-        }
-
-        try:
-            r = session.get(base_url, params=params, timeout=25)
-            r.raise_for_status()
-        except Exception as e:
-            debug["checked"].append({"url": base_url, "params": params, "error": str(e)})
-            continue
-
-        debug["checked"].append({"url": r.url, "kind": "clubPools"})
-        if page_has_player(r.text):
-            debug["found_on"] = r.url
-            return True, debug
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        group_links = []
-        for a in soup.find_all("a", href=True):
-            if "groupPools" in a["href"]:
-                group_links.append(_abs_url(a["href"]))
-        group_links = list(dict.fromkeys(group_links))
-
-        for link in group_links[:80]:
-            try:
-                rr = session.get(link, timeout=25)
-                rr.raise_for_status()
-            except Exception as e:
-                debug["checked"].append({"url": link, "kind": "groupPools", "error": str(e)})
-                continue
-
-            debug["checked"].append({"url": rr.url, "kind": "groupPools"})
-            if page_has_player(rr.text):
-                debug["found_on"] = rr.url
-                return True, debug
-
-    return False, debug
 
 
 # -----------------------------
@@ -861,6 +787,43 @@ def decide_eligibility(
 
 
 # -----------------------------
+# Portrait-based category gate
+# -----------------------------
+def enforce_category_gate_from_portrait(contest_type: str, meta: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Returns (ok, message). Uses Ageclass + Permission to Play.
+    """
+    ageclass = (meta.get("ageclass") or "").upper().strip()
+    perm_from = meta.get("permission_from")
+    perm_to = meta.get("permission_to")
+    today = datetime.date.today()
+
+    # licence validity window if present
+    if perm_from and today < perm_from:
+        return False, f"NOT ELIGIBLE: licence not yet valid (Permission to Play starts {perm_from})."
+    if perm_to and today > perm_to:
+        return False, f"NOT ELIGIBLE: licence expired (Permission to Play ended {perm_to})."
+
+    # Men/Women: any ageclass OK (incl Oxx/youth)
+    if contest_type in ("${herren}", "${damen}"):
+        return True, ""
+
+    # O40: accept any Oxx (O40/O50/O60...)
+    if contest_type == "${o40}":
+        if not ageclass.startswith("O"):
+            return False, f"NOT ELIGIBLE: selected O40, but player's Ageclass is '{ageclass or 'unknown'}'."
+        return True, ""
+
+    # Youth: accept Uxx or Jeunesse
+    if contest_type in ("${jugend}", "${u19}", "${u15}", "${u13}"):
+        if not (ageclass.startswith("U") or "JEUN" in ageclass):
+            return False, f"NOT ELIGIBLE: selected Jeunesse/Uxx, but player's Ageclass is '{ageclass or 'unknown'}'."
+        return True, ""
+
+    return True, ""
+
+
+# -----------------------------
 # UI
 # -----------------------------
 st.set_page_config(page_title="Meyrin CTT – Eligibility Checker", layout="wide")
@@ -884,7 +847,6 @@ if auto_prefix and auto_prefix in by_prefix:
     team_entries = by_prefix[auto_prefix]
     st.sidebar.caption(f"Team group (auto): **{auto_prefix}**")
 else:
-    # fallback: merge all
     merged: Dict[int, List[Tuple[str, str]]] = {}
     for pref, entries in by_prefix.items():
         for team_no, opts in entries.items():
@@ -914,10 +876,9 @@ with c2:
 run_pending_check = st.checkbox("Check last 48h unpublished results (warnings)", value=True)
 show_last48_debug = st.checkbox("Show last 48h debug (teams + matches found)", value=False)
 show_search_debug = st.checkbox("Show player search debug (gender lists/pages)", value=False)
-show_category_debug = st.checkbox("Show category-membership debug", value=False)
 
 max_meetings = st.slider("Max match-days to scan per team+phase", min_value=10, max_value=60, value=35, step=5)
-show_5044 = st.checkbox("Show 50.4.4 ranking/roster info at end (replacement only)", value=True)
+show_5044 = st.checkbox("Show 50.4.4 ranking/roster info at end (replacement/unknown)", value=True)
 
 if st.button("Check eligibility"):
     if not last.strip() or not first.strip():
@@ -950,42 +911,16 @@ if st.button("Check eligibility"):
     if contest_type == "${herren}" and "GENDER:FEMALE" in pick.licence_tags:
         st.info("Detected **FEMALE** licence list. In men series, **dames can also play** (50.4.2).")
 
-
-
-# Category eligibility should come from player portrait (Ageclass), not pools
+    # Portrait meta (Ageclass + Permission)
     meta = fetch_player_meta_from_portrait(pick.portrait_url)
     ageclass = (meta.get("ageclass") or "").upper().strip()
-    
-    # (optional) permission validity check
     perm_from = meta.get("permission_from")
     perm_to = meta.get("permission_to")
-    today = datetime.date.today()
-    if perm_from and today < perm_from:
-        st.error(f"NOT ELIGIBLE: licence not yet valid (Permission to Play starts {perm_from}).")
+
+    ok_cat, msg_cat = enforce_category_gate_from_portrait(contest_type, meta)
+    if not ok_cat:
+        st.error(msg_cat)
         st.stop()
-    if perm_to and today > perm_to:
-        st.error(f"NOT ELIGIBLE: licence expired (Permission to Play ended {perm_to}).")
-        st.stop()
-    
-    # Ageclass-based gates
-    # - Men/Women: any ageclass OK (including O40/O50, youth, etc.)
-    # - O40: require Ageclass startswith "O" and >=40 (O40, O50, O60...)
-    # - Jeunesse/Uxx: require Ageclass indicates youth (Uxx) or "JEUNESSE"
-    if contest_type == "${o40}":
-        if not ageclass.startswith("O"):
-            st.error(f"NOT ELIGIBLE: selected O40, but player's Ageclass is '{ageclass or 'unknown'}'.")
-            st.stop()
-        # accept O40, O50, O60... (any O category counts as eligible for O40+ competitions)
-        # If you want *exactly* O40 only, tell me and I’ll tighten it.
-    elif contest_type in ("${jugend}", "${u19}", "${u15}", "${u13}"):
-        if not (ageclass.startswith("U") or "JEUN" in ageclass):
-            st.error(f"NOT ELIGIBLE: selected Jeunesse/Uxx, but player's Ageclass is '{ageclass or 'unknown'}'.")
-            st.stop()
-
-
-    # Category membership gate for special categories
-
-
 
     nominated_team_no = fetch_regular_registration_nominated_team(season_name, contest_type, player_key)
 
@@ -997,6 +932,7 @@ if st.button("Check eligibility"):
         max_meetings_per_team=max_meetings,
     )
 
+    total_apps = sum(apps_by_team.values())
     ok, messages, base_team_no = decide_eligibility(target, nominated_team_no, teams_by_no, apps_by_team)
     player_rank = fetch_player_ranking_from_portrait(pick.portrait_url) or ""
 
@@ -1018,10 +954,13 @@ if st.button("Check eligibility"):
             "player_ranking": player_rank or "unknown",
             "licence_tags_detected": list(pick.licence_tags),
             "selected_category": contest_choice,
+            "ageclass": ageclass or None,
+            "permission_to_play": f"{perm_from} - {perm_to}" if (perm_from or perm_to) else None,
             "auto_team_group_prefix": auto_prefix,
             "nominated_team_no": nominated_team_no,
             "base_team_no": (base_team_no if base_team_no != -1 else None),
             "apps_by_team_matchdays": apps_by_team,
+            "total_apps_matchdays": total_apps,
             "target_team": f"{target.name} ({target.league_label})",
         }
     )
@@ -1045,13 +984,31 @@ if st.button("Check eligibility"):
         st.markdown("### Debug — last 48 hours scan")
         st.json(last48_debug_data or {})
 
-    # 50.4.4 at the end (replacement only)
+    # 50.4.4 at the end (replacement OR unknown base/no history)
     if show_5044 and ok:
-        is_replacement = (base_team_no != -1 and target.team_no != base_team_no)
+        # Replacement detection:
+        # - nominated team known: replacement = target != nominated
+        # - else history base known: replacement = target != base
+        # - else unknown (no history + no nominated): treat as replacement with warning
+        replacement_mode = "unknown"
+        if nominated_team_no is not None:
+            is_replacement = (target.team_no != nominated_team_no)
+            replacement_mode = "known(from nominated_team_no)"
+        elif base_team_no != -1:
+            is_replacement = (target.team_no != base_team_no)
+            replacement_mode = "known(from history base_team_no)"
+        else:
+            is_replacement = True
+            replacement_mode = "unknown(no nominated team + no history)"
+
         if is_replacement:
             st.markdown("### 50.4.4 — Remplacement / Ranking check (manual verification)")
             st.write("Rule 50.4.4: **Le classement du joueur remplaçant ne peut être supérieur à celui du joueur titulaire qu'il remplace.**")
             st.write(f"- Replacement player: **{player_key.last}, {player_key.first}** — ranking: **{player_rank or 'unknown'}**")
+            st.caption(f"Replacement detection: {replacement_mode}")
+
+            if replacement_mode.startswith("unknown"):
+                st.warning("Base team could not be determined (no history / not nominated). Treat as replacement and verify manually.")
 
             team_page = find_team_page_from_league(target.league_url, target.team_no, club_prefix="Meyrin")
             roster = fetch_team_roster_with_rankings(team_page) if team_page else []
