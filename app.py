@@ -866,7 +866,10 @@ if st.button("Check eligibility"):
     player_rank = fetch_player_ranking_from_portrait(pick.portrait_url) or ""
 
     st.markdown("### Result")
-    st.success(messages[0]) if ok else st.error(messages[0])
+    if ok:
+        st.success(messages[0]) 
+    else:
+        st.error(messages[0])
 
     st.markdown("### Reasoning / Warnings")
     for m in messages[1:]:
