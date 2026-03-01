@@ -412,6 +412,51 @@ def infer_player_name_from_portrait(portrait_url: str) -> PlayerKey:
     return PlayerKey(last="", first="")
 
 
+
+
+@st.cache_data(ttl=3600)
+def fetch_player_meta_from_portrait(portrait_url: str) -> Dict[str, Any]:
+    """
+    Extracts Ageclass + Permission to Play date range from player portrait page (best-effort).
+    Returns:
+      {
+        "ageclass": "O50" / "O40" / "U19" / ... / None,
+        "permission_from": date or None,
+        "permission_to": date or None,
+      }
+    """
+    r = session.get(portrait_url, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # We'll parse by locating labels like "Ageclass" and "Permission to Play"
+    text = soup.get_text("\n", strip=True)
+    lines = [_norm(x) for x in text.split("\n") if _norm(x)]
+
+    meta: Dict[str, Any] = {"ageclass": None, "permission_from": None, "permission_to": None}
+
+    def parse_date(s: str) -> Optional[datetime.date]:
+        m = re.search(r"\b(\d{2})\.(\d{2})\.(\d{4})\b", s)
+        if not m:
+            return None
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return datetime.date(y, mo, d)
+
+    for i, ln in enumerate(lines):
+        if ln.lower() == "ageclass" and i + 1 < len(lines):
+            meta["ageclass"] = lines[i + 1].strip() or None
+        if ln.lower() == "permission to play" and i + 1 < len(lines):
+            # example: "01.07.2025 - 30.06.2026"
+            nxt = lines[i + 1]
+            d1 = parse_date(nxt)
+            # try second date
+            m2 = re.findall(r"\b\d{2}\.\d{2}\.\d{4}\b", nxt)
+            d2 = parse_date(m2[1]) if len(m2) >= 2 else None
+            meta["permission_from"] = d1
+            meta["permission_to"] = d2
+
+    return meta
+
 # -----------------------------
 # Ranking (best-effort)
 # -----------------------------
@@ -905,16 +950,42 @@ if st.button("Check eligibility"):
     if contest_type == "${herren}" and "GENDER:FEMALE" in pick.licence_tags:
         st.info("Detected **FEMALE** licence list. In men series, **dames can also play** (50.4.2).")
 
-    # Category membership gate for special categories
-    STRICT_CATEGORIES = {"${o40}", "${jugend}", "${u19}", "${u15}", "${u13}"}
-    if contest_type in STRICT_CATEGORIES:
-        in_cat, cat_dbg = player_is_in_contest_category(season_name, contest_type, player_key)
-        if not in_cat:
-            st.error("NOT ELIGIBLE: player is not listed in this category (O40/Jeunesse/Uxx) for the selected season.")
-            if show_category_debug:
-                st.markdown("### Debug — category membership check")
-                st.json(cat_dbg)
+
+
+# Category eligibility should come from player portrait (Ageclass), not pools
+    meta = fetch_player_meta_from_portrait(pick.portrait_url)
+    ageclass = (meta.get("ageclass") or "").upper().strip()
+    
+    # (optional) permission validity check
+    perm_from = meta.get("permission_from")
+    perm_to = meta.get("permission_to")
+    today = datetime.date.today()
+    if perm_from and today < perm_from:
+        st.error(f"NOT ELIGIBLE: licence not yet valid (Permission to Play starts {perm_from}).")
+        st.stop()
+    if perm_to and today > perm_to:
+        st.error(f"NOT ELIGIBLE: licence expired (Permission to Play ended {perm_to}).")
+        st.stop()
+    
+    # Ageclass-based gates
+    # - Men/Women: any ageclass OK (including O40/O50, youth, etc.)
+    # - O40: require Ageclass startswith "O" and >=40 (O40, O50, O60...)
+    # - Jeunesse/Uxx: require Ageclass indicates youth (Uxx) or "JEUNESSE"
+    if contest_type == "${o40}":
+        if not ageclass.startswith("O"):
+            st.error(f"NOT ELIGIBLE: selected O40, but player's Ageclass is '{ageclass or 'unknown'}'.")
             st.stop()
+        # accept O40, O50, O60... (any O category counts as eligible for O40+ competitions)
+        # If you want *exactly* O40 only, tell me and I’ll tighten it.
+    elif contest_type in ("${jugend}", "${u19}", "${u15}", "${u13}"):
+        if not (ageclass.startswith("U") or "JEUN" in ageclass):
+            st.error(f"NOT ELIGIBLE: selected Jeunesse/Uxx, but player's Ageclass is '{ageclass or 'unknown'}'.")
+            st.stop()
+
+
+    # Category membership gate for special categories
+
+
 
     nominated_team_no = fetch_regular_registration_nominated_team(season_name, contest_type, player_key)
 
