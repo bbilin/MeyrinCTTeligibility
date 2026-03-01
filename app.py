@@ -860,12 +860,12 @@ st.set_page_config(page_title="Meyrin CTT – Eligibility Checker", layout="wide
 st.title("Meyrin CTT – Eligibility Checker")
 
 with st.sidebar:
-    st.header("Season / Category")
-    season_name = st.text_input("Season (format 2025/26)", value="2025/26")
-    contest_choice = st.selectbox("Category (contestType)", options=[c[0] for c in CONTEST_TYPES])
+    st.header("Saison / Categorie (Season / Category)")
+    season_name = st.text_input("Saison (Season) (format 2025/26)", value="2025/26")
+    contest_choice = st.selectbox("Categorie (Category) (contestType)", options=[c[0] for c in CONTEST_TYPES])
     contest_type = TOKEN_BY_LABEL[contest_choice]
 
-    st.header("Phase (for team dropdown)")
+    st.header("Phase")
     ui_phase = st.selectbox("Phase", options=["A", "B"], index=["A", "B"].index(infer_default_phase()))
 
 # Teams: auto-detect correct prefix group from clubTeams
@@ -875,44 +875,44 @@ auto_prefix = choose_prefix_for_contest_type(available_prefixes, contest_type)
 
 if auto_prefix and auto_prefix in by_prefix:
     team_entries = by_prefix[auto_prefix]
-    st.sidebar.caption(f"Team group (auto): **{auto_prefix}**")
+    st.sidebar.caption(f"Groupe équipe (Team group) (auto): **{auto_prefix}**")
 else:
     merged: Dict[int, List[Tuple[str, str]]] = {}
     for pref, entries in by_prefix.items():
         for team_no, opts in entries.items():
             merged.setdefault(team_no, []).extend(opts)
     team_entries = merged
-    st.sidebar.caption("Team group (auto): **ALL** (no clear match)")
+    st.sidebar.caption("Groupe équipe (Team group) (auto): **ALL** (no clear match)")
 
 teams_ui = build_teams_for_phase(team_entries, ui_phase)
 teams_by_no = {t.team_no: t for t in teams_ui}
 
 with st.sidebar:
-    st.header("Target team")
+    st.header("dans quelle équipe (Target team)")
     if not teams_ui:
-        st.error("No teams found for this category/group on click-tt clubTeams page.")
+        st.error("Pas d'équipes trouvées dans cette categorie sur click-tt (No teams found for this category/group on click-tt clubTeams page.)")
         st.stop()
-    target = st.selectbox("Team", options=teams_ui, format_func=lambda t: f"{t.name} — {t.league_label}")
+    target = st.selectbox("équipe (Team)", options=teams_ui, format_func=lambda t: f"{t.name} — {t.league_label}")
 
 st.divider()
-st.subheader("Player")
+st.subheader("Joueur (Player)")
 
 c1, c2 = st.columns(2)
 with c1:
-    last = st.text_input("Last name", value="")
+    last = st.text_input("Nom (Last name)", value="")
 with c2:
-    first = st.text_input("First name", value="")
+    first = st.text_input("Prénom (First name)", value="")
 
-run_pending_check = st.checkbox("Check last 48h unpublished results (warnings)", value=True)
-show_last48_debug = st.checkbox("Show last 48h debug (teams + matches found)", value=False)
-show_search_debug = st.checkbox("Show player search debug (gender lists/pages)", value=False)
+run_pending_check = st.checkbox("Verifier les résultats non télécharges 48h avant (Check last 48h unpublished results (warnings))", value=True)
+show_last48_debug = st.checkbox("DEBUG: pour verification des résultats non télécharges 48h avant (Show last 48h debug (teams + matches found))", value=False)
+show_search_debug = st.checkbox("DEBUG: Info des joueurs (Show player search debug (gender lists/pages))", value=False)
 
-max_meetings = st.slider("Max match-days to scan per team+phase", min_value=10, max_value=60, value=35, step=5)
-show_5044 = st.checkbox("Show 50.4.4 ranking/roster info at end (replacement/unknown)", value=True)
+max_meetings = st.slider(" Parametre de scan(il faut verifier la necessité) (Max match-days to scan per team+phase)", min_value=10, max_value=60, value=20, step=5)
+show_5044 = st.checkbox("Montre les infos de ranking pour RS 50.4.4 (Show 50.4.4 ranking/roster info at end (replacement/unknown))", value=True)
 
-if st.button("Check eligibility"):
+if st.button("Verifier l'éligibilite (Check eligibility)"):
     if not last.strip() or not first.strip():
-        st.error("Please enter both last name and first name.")
+        st.error("Remplir le nom ET le prénom (Please enter both last name and first name.)")
         st.stop()
 
     picks, search_dbg = search_player_in_meyrin_club(season_name=season_name, last=last.strip(), first=first.strip())
@@ -922,7 +922,7 @@ if st.button("Check eligibility"):
         st.json(search_dbg)
 
     if not picks:
-        st.error("Player not found in Meyrin licence lists (gender MALE/FEMALE searched).")
+        st.error("(Joueur non trouvé dans la liste de joueurs licenciés. ) Player not found in Meyrin licence lists (gender MALE/FEMALE searched).")
         st.stop()
 
     pick = picks[0]
@@ -939,7 +939,7 @@ if st.button("Check eligibility"):
 
     # 50.4.2 info (women allowed in men series)
     if contest_type == "${herren}" and "GENDER:FEMALE" in pick.licence_tags:
-        st.info("Detected **FEMALE** licence list. In men series, **dames can also play** (50.4.2).")
+        st.info("Trouvé dans la liste de dammes (Detected **FEMALE** licence list). Peut jouer également dans les series hommes (In men series, **dames can also play**) (50.4.2).")
 
     # Portrait meta (Ageclass + Permission)
     meta = fetch_player_meta_from_portrait(pick.portrait_url)
@@ -966,7 +966,7 @@ if st.button("Check eligibility"):
     ok, messages, base_team_no = decide_eligibility(target, nominated_team_no, teams_by_no, apps_by_team)
     player_rank = fetch_player_ranking_from_portrait(pick.portrait_url) or ""
 
-    st.markdown("### Result")
+    st.markdown("### Resultat (Result)")
     if ok:
         st.success(messages[0])
     else:
@@ -1004,8 +1004,8 @@ if st.button("Check eligibility"):
 
         if warnings:
             st.warning(
-                "Recent matches (last 48h) in other teams of the same league may have unpublished results. "
-                "Verify with the other team:"
+                "Des matches recents d'autres equipes dans la meme ligue qui peuvent avoir les resultats non telecharges (Recent matches (last 48h) in other teams of the same league may have unpublished results.)"
+                "Verifiez avec l'équipe: (Verify with the other team:)"
             )
             for w in warnings:
                 st.write(f"- {w}")
