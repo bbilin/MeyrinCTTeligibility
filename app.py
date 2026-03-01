@@ -895,7 +895,7 @@ with st.sidebar:
     target = st.selectbox("équipe (Team)", options=teams_ui, format_func=lambda t: f"{t.name} — {t.league_label}")
 
 st.divider()
-st.subheader("Joueur (Player)")
+st.subheader("Joueur (Player) (Pour les autres options cliquez sur la fleche (>>) ci-dessus (équipe, categorie etc.))")
 
 c1, c2 = st.columns(2)
 with c1:
