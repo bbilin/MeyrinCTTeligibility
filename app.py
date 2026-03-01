@@ -291,21 +291,26 @@ def _find_next_page_url(html: str) -> Optional[str]:
             return _abs_url(href)
     return None
 
-
-def fetch_all_licence_members_for_category(season_name: str, contest_type: str) -> Tuple[List[Tuple[str, str]], Dict[str, Any]]:
+@st.cache_data(ttl=3600)
+def fetch_all_licence_members_by_gender(season_name: str, gender: Optional[str]) -> Tuple[List[Tuple[str, str]], Dict[str, Any]]:
     """
-    Downloads clubLicenceMembersPage for a given contestType and seasonName, following pagination.
+    Downloads clubLicenceMembersPage for a given gender (MALE/FEMALE) and seasonName, following pagination.
     Returns (players, debug_info).
+
+    gender: "MALE" | "FEMALE" | None (no param)
     """
     url = f"{BASE}/clubLicenceMembersPage"
     params = {
         "club": str(MEYRIN_CLUB_ID),
-        "contestType": contest_type,
-        "seasonName": season_name,
         "preferredLanguage": "German",
     }
+    # seasonName helps keep it strict for the chosen season (if the site supports it here)
+    if season_name:
+        params["seasonName"] = season_name
+    if gender:
+        params["gender"] = gender
 
-    debug = {"contestType": contest_type, "pages": 0, "players": 0, "urls": []}
+    debug = {"gender": gender or "NONE", "pages": 0, "players": 0, "urls": []}
     all_players: List[Tuple[str, str]] = []
     seen_urls = set()
 
@@ -318,8 +323,8 @@ def fetch_all_licence_members_for_category(season_name: str, contest_type: str) 
 
     html = r.text
     current_url = r.url
-    # follow up to 5 pages max (safety)
-    for _ in range(5):
+
+    for _ in range(10):  # allow more pages if needed
         debug["pages"] += 1
         debug["urls"].append(current_url)
 
@@ -349,19 +354,21 @@ def fetch_all_licence_members_for_category(season_name: str, contest_type: str) 
 
 def search_player_in_meyrin_club(season_name: str, last: str, first: str) -> Tuple[List[PlayerPick], Dict[str, Any]]:
     """
-    Search player across all licence categories for the given season, with pagination.
+    Search player in Meyrin club licence lists using gender parameter (MALE/FEMALE).
+    This is required on click-tt because contestType does not switch the licence list.
     Returns (picks, debug).
     """
     q_last = _fold(last)
     q_first = _fold(first)
 
-    found: Dict[str, Dict[str, Any]] = {}  # portrait_url -> {"display": name, "cats": set()}
-    dbg: Dict[str, Any] = {"seasonName": season_name, "by_category": []}
+    # portrait_url -> {"display": str, "cats": set()}
+    # We'll store "gender sources" in licence_categories for display ("GENDER:FEMALE"/"GENDER:MALE")
+    found: Dict[str, Dict[str, Any]] = {}
+    dbg: Dict[str, Any] = {"seasonName": season_name, "by_gender": []}
 
-    for ct_label, ct_token in CONTEST_TYPES:
-        players, d = fetch_all_licence_members_for_category(season_name, ct_token)
-        d["categoryLabel"] = ct_label
-        dbg["by_category"].append(d)
+    for gender in ["MALE", "FEMALE"]:
+        players, d = fetch_all_licence_members_by_gender(season_name, gender)
+        dbg["by_gender"].append(d)
 
         for name_raw, purl in players:
             name_fold = _fold(name_raw)
@@ -372,13 +379,27 @@ def search_player_in_meyrin_club(season_name: str, last: str, first: str) -> Tup
 
             if purl not in found:
                 found[purl] = {"display": name_raw, "cats": set()}
-            found[purl]["cats"].add(ct_token)
+            found[purl]["cats"].add(f"GENDER:{gender}")
+
+    # Fallback: some cases might be visible only without gender param
+    if not found:
+        players, d = fetch_all_licence_members_by_gender(season_name, gender=None)
+        d["note"] = "fallback without gender param"
+        dbg["by_gender"].append(d)
+        for name_raw, purl in players:
+            name_fold = _fold(name_raw)
+            if q_last and q_last not in name_fold:
+                continue
+            if q_first and q_first not in name_fold:
+                continue
+            if purl not in found:
+                found[purl] = {"display": name_raw, "cats": set()}
+            found[purl]["cats"].add("GENDER:NONE")
 
     picks: List[PlayerPick] = []
     for purl, info in found.items():
         picks.append(PlayerPick(info["display"], purl, tuple(sorted(info["cats"]))))
 
-    # rank results: more exact match first
     q = (q_last + " " + q_first).strip()
 
     def score(p: PlayerPick) -> int:
@@ -391,6 +412,7 @@ def search_player_in_meyrin_club(season_name: str, last: str, first: str) -> Tup
 
     picks.sort(key=score)
     return picks, dbg
+
 
 
 def infer_player_name_from_portrait(portrait_url: str) -> PlayerKey:
@@ -823,11 +845,11 @@ if st.button("Check eligibility"):
     if not player_key.last or not player_key.first:
         player_key = PlayerKey(last=last.strip(), first=first.strip())
 
-    licence_labels = [CT_LABEL_BY_TOKEN.get(x, x) for x in pick.licence_categories]
-
+    licence_labels = list(pick.licence_categories)
     # 50.4.2 informational note
-    if contest_type == "${herren}" and "${damen}" in pick.licence_categories and "${herren}" not in pick.licence_categories:
-        st.info("Detected **Damen** licence. In men category, **dames can also play** (commonly ref. 50.4.2).")
+
+    if contest_type == "${herren}" and "GENDER:FEMALE" in pick.licence_categories:
+        st.info("Detected player on **FEMALE** licence list. In men series, **dames can also play** (50.4.2).")
 
     nominated_team_no = fetch_regular_registration_nominated_team(season_name, contest_type, player_key)
 
